@@ -1,0 +1,143 @@
+const AUTOMATION_TEMPLATES = [
+  // ─── CORE ─────────────────────────────────────────
+  {
+    id: 'new_lead_followup',
+    name: 'Follow up on every new lead',
+    description: 'Creates a follow-up task the moment a new contact is added — so no lead falls through the cracks',
+    category: 'core',
+    icon: '🎯',
+    trigger: { type: 'contact.created', config: {} },
+    conditions: [],
+    actions: [{
+      type: 'create_task',
+      config: { taskTitle: 'Follow up with {{contact.firstName}} {{contact.lastName}}', taskPriority: 'high', taskDueDays: 0, assignTo: 'same_as_contact' },
+    }],
+  },
+  {
+    id: 'follow_up_cold_deal',
+    name: 'Follow up when a deal goes cold',
+    description: 'Creates a task and emails the deal owner when a deal has had no activity for 3 days',
+    category: 'core',
+    icon: '🥶',
+    trigger: { type: 'deal.inactive', config: { inactiveDays: 3 } },
+    conditions: [],
+    actions: [
+      { type: 'create_task', config: { taskTitle: 'Re-engage: {{deal.title}} has gone cold', taskPriority: 'high', taskDueDays: 0, assignTo: 'same_as_deal' } },
+      { type: 'send_email', config: { to: 'assigned_user', subject: 'Deal going cold: {{deal.title}}', body: '<p>Hi,</p><p>Your deal <strong>{{deal.title}}</strong> with {{contact.firstName}} {{contact.lastName}} has had no activity for 3 days.</p><p>Log in to take action before you lose the opportunity.</p>' } },
+    ],
+  },
+  {
+    id: 'auto_assign_new_lead',
+    name: 'Auto-assign new leads to a team member',
+    description: 'Automatically assigns every new contact to a specific sales rep',
+    category: 'core',
+    icon: '👤',
+    trigger: { type: 'contact.created', config: {} },
+    conditions: [],
+    actions: [{ type: 'assign_to_user', config: { userId: '' } }],
+  },
+  {
+    id: 'new_contact_create_deal',
+    name: 'Open a deal when a new contact is added',
+    description: 'Automatically creates a deal in your pipeline every time a new contact is added',
+    category: 'core',
+    icon: '🚀',
+    trigger: { type: 'contact.created', config: {} },
+    conditions: [],
+    actions: [{ type: 'create_deal', config: { dealTitle: 'New opportunity — {{contact.firstName}} {{contact.lastName}}', assignDealTo: 'same_as_contact', pipelineId: '', stageId: '' } }],
+  },
+
+  // ─── DEALS ────────────────────────────────────────
+  {
+    id: 'deal_stage_task',
+    name: 'Create a task when a deal changes stage',
+    description: 'Creates an action task whenever a deal moves to a specific stage',
+    category: 'deals',
+    icon: '📋',
+    trigger: { type: 'deal.stage_changed', config: {} },
+    conditions: [],
+    actions: [{ type: 'create_task', config: { taskTitle: 'Action required: {{deal.title}}', taskPriority: 'medium', taskDueDays: 2, assignTo: 'same_as_deal' } }],
+  },
+  {
+    id: 'deal_won_tag',
+    name: 'Tag contact when deal is won',
+    description: 'Adds a "customer" tag and notifies the deal owner when a deal is won',
+    category: 'deals',
+    icon: '🎉',
+    trigger: { type: 'deal.won', config: {} },
+    conditions: [],
+    actions: [
+      { type: 'add_tag', config: { tag: 'customer' } },
+      { type: 'send_notification', config: { message: 'Deal won: {{deal.title}}!', targetUser: 'assigned_user' } },
+    ],
+  },
+  {
+    id: 'deal_lost_followup',
+    name: 'Re-engage a lost deal in 30 days',
+    description: 'Tags the contact and creates a 30-day follow-up task to try again later',
+    category: 'deals',
+    icon: '📉',
+    trigger: { type: 'deal.lost', config: {} },
+    conditions: [],
+    actions: [
+      { type: 'add_tag', config: { tag: 'lost-deal' } },
+      { type: 'create_task', config: { taskTitle: 'Re-engage {{contact.firstName}} — lost deal follow-up', taskPriority: 'low', taskDueDays: 30, assignTo: 'same_as_deal' } },
+    ],
+  },
+  {
+    id: 'quote_viewed_notify',
+    name: 'Notify when client views a quote',
+    description: 'Sends an in-app notification to the deal owner when a client opens a shared quote',
+    category: 'deals',
+    icon: '👁️',
+    trigger: { type: 'quote.viewed', config: {} },
+    conditions: [],
+    actions: [{ type: 'send_notification', config: { message: 'Client opened quote: {{deal.title}}', targetUser: 'assigned_user' } }],
+  },
+
+  // ─── TASKS ────────────────────────────────────────
+  {
+    id: 'overdue_task_email',
+    name: 'Remind rep about overdue tasks',
+    description: 'Sends an email to the assigned rep when a task becomes overdue',
+    category: 'tasks',
+    icon: '⏰',
+    trigger: { type: 'task.overdue', config: {} },
+    conditions: [],
+    actions: [{ type: 'send_email', config: { to: 'assigned_user', subject: 'Overdue: {{task.title}}', body: '<p>Hi,</p><p>You have an overdue task: <strong>{{task.title}}</strong>. Please action this as soon as possible.</p>' } }],
+  },
+
+  // ─── ADVANCED ─────────────────────────────────────
+  {
+    id: 'n8n_new_contact',
+    name: 'Send new contact to n8n',
+    description: 'Fires a webhook to your n8n workflow every time a new contact is added',
+    category: 'advanced',
+    icon: '🔗',
+    trigger: { type: 'contact.created', config: {} },
+    conditions: [],
+    actions: [{ type: 'send_webhook', config: { url: '', method: 'POST', payload: 'full_context' } }],
+  },
+  {
+    id: 'n8n_deal_won',
+    name: 'Send won deal to n8n',
+    description: 'Fires a webhook when a deal is won — post to Slack, Google Sheets, WhatsApp etc.',
+    category: 'advanced',
+    icon: '🔗',
+    trigger: { type: 'deal.won', config: {} },
+    conditions: [],
+    actions: [{ type: 'send_webhook', config: { url: '', method: 'POST', payload: 'full_context' } }],
+  },
+  {
+    id: 'n8n_deal_stage',
+    name: 'Notify n8n on deal stage change',
+    description: 'Fires a webhook every time a deal moves to a new stage',
+    category: 'advanced',
+    icon: '🔗',
+    trigger: { type: 'deal.stage_changed', config: {} },
+    conditions: [],
+    actions: [{ type: 'send_webhook', config: { url: '', method: 'POST', payload: 'full_context' } }],
+  },
+];
+
+export default AUTOMATION_TEMPLATES;
