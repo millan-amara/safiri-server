@@ -5,6 +5,7 @@ import { Deal, Pipeline } from '../models/Deal.js';
 import User from '../models/User.js';
 import { createNotification } from '../routes/notifications.js';
 import { sendEmail } from '../utils/email.js';
+import { notifyRecordInactive, notifyTaskOverdue } from '../utils/whatsapp.js';
 
 // Replace {{contact.firstName}}, {{deal.title}} etc.
 function interpolate(template, context) {
@@ -284,10 +285,27 @@ export async function checkInactiveDeals() {
           isActive: true,
           stage: { $nin: ['Won', 'Lost'] },
           updatedAt: { $lt: cutoff },
-        }).populate('assignedTo', 'name email').populate('contact', 'firstName lastName email');
+        }).populate('assignedTo', 'name email phone').populate('contact', 'firstName lastName email');
 
         for (const deal of inactiveDeals) {
           await triggerAutomation('deal.inactive', { organizationId: orgId, deal });
+
+          // WhatsApp — send once, then re-notify after 7 days if still inactive
+          if (deal.assignedTo?.phone) {
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+            const shouldNotify = !deal.inactiveNotifiedAt || deal.inactiveNotifiedAt < sevenDaysAgo;
+            if (shouldNotify) {
+              const daysAgo = Math.floor((Date.now() - new Date(deal.updatedAt).getTime()) / (1000 * 60 * 60 * 24));
+              notifyRecordInactive({
+                to: deal.assignedTo.phone,
+                userName: deal.assignedTo.name,
+                recordTitle: deal.title,
+                daysAgo,
+              })
+                .then(() => Deal.findByIdAndUpdate(deal._id, { inactiveNotifiedAt: new Date() }))
+                .catch(err => console.error('[WhatsApp] notifyRecordInactive failed:', err.message));
+            }
+          }
         }
       }
     }
@@ -305,13 +323,26 @@ export async function checkOverdueTasks() {
         organization: orgId,
         status: { $in: ['todo', 'in_progress'] },
         dueDate: { $lt: new Date() },
-      }).populate('assignedTo', 'name email').populate('deal', 'title');
+      }).populate('assignedTo', 'name email phone').populate('deal', 'title');
 
       for (const task of overdueTasks) {
         await triggerAutomation('task.overdue', { organizationId: orgId, task });
+
+        // WhatsApp — fires once (dedup via overdueNotifiedAt), non-blocking
+        if (task.assignedTo?.phone && !task.overdueNotifiedAt) {
+          notifyTaskOverdue({
+            to: task.assignedTo.phone,
+            userName: task.assignedTo.name,
+            taskTitle: task.title,
+            dueDate: task.dueDate,
+          })
+            .then(() => Task.findByIdAndUpdate(task._id, { overdueNotifiedAt: new Date() }))
+            .catch(err => console.error('[WhatsApp] notifyTaskOverdue failed:', err.message));
+        }
       }
     }
   } catch (err) {
     console.error('checkOverdueTasks error:', err.message);
   }
 }
+

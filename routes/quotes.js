@@ -1,10 +1,32 @@
 import { Router } from 'express';
 import Quote from '../models/Quote.js';
 import Organization from '../models/Organization.js';
+import Hotel from '../models/Hotel.js';
 import { protect } from '../middleware/auth.js';
+import { requireTrialQuoteQuota, trackTrialQuoteUsage } from '../middleware/subscription.js';
 import { createNotification } from './notifications.js';
 
 const router = Router();
+
+// Fill in hotel images on days where the snapshot is missing them
+async function hydrateHotelImages(quote) {
+  const needs = (quote.days || []).filter(d => d.hotel?.name && !d.hotel.images?.length);
+  if (!needs.length) return;
+  const ids = [...new Set(needs.map(d => d.hotel.hotelId || d.hotel._id).filter(Boolean).map(String))];
+  const names = [...new Set(needs.map(d => d.hotel.name).filter(Boolean))];
+  const orConds = [];
+  if (ids.length) orConds.push({ _id: { $in: ids } });
+  if (names.length) orConds.push({ organization: quote.organization, name: { $in: names } });
+  if (!orConds.length) return;
+  const hotels = await Hotel.find({ $or: orConds }).select('name images').lean();
+  const byId = new Map(hotels.map(h => [String(h._id), h.images || []]));
+  const byName = new Map(hotels.map(h => [h.name, h.images || []]));
+  for (const d of needs) {
+    const id = d.hotel.hotelId || d.hotel._id;
+    const imgs = (id && byId.get(String(id))) || byName.get(d.hotel.name) || [];
+    if (imgs.length) d.hotel.images = imgs;
+  }
+}
 
 // List quotes
 router.get('/', protect, async (req, res) => {
@@ -59,9 +81,9 @@ function sanitizeDays(days) {
 }
 
 // Create quote
-router.post('/', protect, async (req, res) => {
+router.post('/', protect, requireTrialQuoteQuota, async (req, res) => {
   try {
-    // Snapshot branding at creation time
+    // Snapshot branding at creation time (need full doc for branding fields)
     const org = await Organization.findById(req.organizationId);
     const brandingSnapshot = {
       logo: org.branding.logo,
@@ -71,10 +93,15 @@ router.post('/', protect, async (req, res) => {
       companyEmail: org.businessInfo.email,
       companyPhone: org.businessInfo.phone,
       companyAddress: org.businessInfo.address,
+      aboutUs: org.businessInfo.aboutUs,
+      coverQuote: org.branding.coverQuote,
+      coverQuoteAuthor: org.branding.coverQuoteAuthor,
     };
 
     const body = { ...req.body };
     if (body.days) body.days = sanitizeDays(body.days);
+    if (body.contact === '' || body.contact === null) delete body.contact;
+    if (body.deal === '' || body.deal === null) delete body.deal;
 
     const quote = await Quote.create({
       ...body,
@@ -90,6 +117,9 @@ router.post('/', protect, async (req, res) => {
         currency: body.pricing?.currency || org.defaults.currency,
       },
     });
+
+    // Increment trial quote counter (no-op if not on trial)
+    await trackTrialQuoteUsage(req.organizationId, req.organization?.plan);
 
     res.status(201).json(quote);
   } catch (error) {
@@ -109,6 +139,8 @@ router.put('/:id', protect, async (req, res) => {
   try {
     const body = { ...req.body };
     if (body.days) body.days = sanitizeDays(body.days);
+    if (body.contact === '' || body.contact === null) body.contact = undefined;
+    if (body.deal === '' || body.deal === null) body.deal = undefined;
 
     const quote = await Quote.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -217,7 +249,7 @@ router.post('/:id/save-as-template', protect, async (req, res) => {
 });
 
 // Duplicate template into a new quote
-router.post('/templates/:id/use', protect, async (req, res) => {
+router.post('/templates/:id/use', protect, requireTrialQuoteQuota, async (req, res) => {
   try {
     const template = await Quote.findOne({ _id: req.params.id, organization: req.organizationId, isTemplate: true });
     if (!template) return res.status(404).json({ message: 'Template not found' });
@@ -246,6 +278,8 @@ router.post('/templates/:id/use', protect, async (req, res) => {
       createdBy: req.user._id,
     });
 
+    await trackTrialQuoteUsage(req.organizationId, req.organization?.plan);
+
     res.status(201).json(newQuote);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -266,7 +300,9 @@ router.delete('/:id', protect, async (req, res) => {
 
 router.get('/share/:token', async (req, res) => {
   try {
-    const quote = await Quote.findOne({ shareToken: req.params.token });
+    const quote = await Quote.findOne({ shareToken: req.params.token })
+      .populate('createdBy', 'name email phone jobTitle avatar signature signatureNote')
+      .populate('contact', 'firstName lastName email country');
     if (!quote) return res.status(404).json({ message: 'Quote not found' });
 
     if (quote.shareSettings.expiresAt && new Date() > quote.shareSettings.expiresAt) {
@@ -302,6 +338,19 @@ router.get('/share/:token', async (req, res) => {
 
     // Return clean version for client (no internal pricing)
     const clientQuote = quote.toObject();
+    const snap = clientQuote.brandingSnapshot || {};
+    if (!snap.coverQuote || !snap.aboutUs) {
+      const org = await Organization.findById(clientQuote.organization).select('branding businessInfo').lean();
+      if (org) {
+        clientQuote.brandingSnapshot = {
+          ...snap,
+          coverQuote: snap.coverQuote || org.branding?.coverQuote || '',
+          coverQuoteAuthor: snap.coverQuoteAuthor || org.branding?.coverQuoteAuthor || '',
+          aboutUs: snap.aboutUs || org.businessInfo?.aboutUs || '',
+        };
+      }
+    }
+    await hydrateHotelImages(clientQuote);
     if (clientQuote.pricing.displayMode === 'total_only') {
       delete clientQuote.pricing.subtotal;
       delete clientQuote.pricing.marginPercent;

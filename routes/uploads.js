@@ -107,6 +107,23 @@ router.post('/logo', protect, upload.single('logo'), async (req, res) => {
   }
 });
 
+// ─── USER ASSET (avatar / signature) ─────────────
+router.post('/user-asset', protect, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    let url;
+    if (configureCloudinary()) {
+      const result = await uploadToCloudinary(req.file.buffer, `${req.organizationId}/users/${req.user._id}`);
+      url = result.secure_url;
+    } else {
+      url = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    }
+    res.json({ url });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // ─── DELETE IMAGE ───────────────────────────────
 
 router.delete('/image', protect, async (req, res) => {

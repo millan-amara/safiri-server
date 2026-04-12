@@ -6,6 +6,12 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, lowercase: true, trim: true },
   password: { type: String, select: false },  // Hidden by default
   avatar: { type: String, default: '' },
+  phone: { type: String, trim: true, default: '' },
+
+  // Quote signature block — shown on closing page of quotes authored by this user
+  jobTitle: { type: String, trim: true, default: '' },
+  signature: { type: String, default: '' },      // URL to handwritten signature image
+  signatureNote: { type: String, default: '' },  // Short personal note shown above signature
   
   // Auth
   googleId: { type: String, sparse: true },

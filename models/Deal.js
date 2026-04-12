@@ -84,6 +84,7 @@ const dealSchema = new mongoose.Schema({
   wonAt: Date,
   lostAt: Date,
   lostReason: String,
+  inactiveNotifiedAt: { type: Date, default: null }, // set when inactive WhatsApp is sent — resets when deal is touched
   
   isActive: { type: Boolean, default: true },
 }, { timestamps: true });

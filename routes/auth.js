@@ -12,16 +12,26 @@ const router = Router();
 // Register new org + owner
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, password, companyName } = req.body;
+    const { name, email, password, companyName, phone } = req.body;
+    if (!phone) return res.status(400).json({ message: 'Phone number is required' });
 
     // Create org
     const slug = slugify(companyName || name, { lower: true, strict: true }) + '-' + Date.now().toString(36);
     const apiKey = 'sk_' + crypto.randomBytes(24).toString('hex');
+    const trialStartedAt = new Date();
+    const trialEndsAt = new Date(trialStartedAt.getTime() + 14 * 24 * 60 * 60 * 1000);
+    const aiCreditsResetAt = (() => {
+      const d = new Date();
+      return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)); // 1st of next month
+    })();
     const org = await Organization.create({
       name: companyName || `${name}'s Organization`,
       slug,
       apiKey,
       owner: '000000000000000000000000', // placeholder
+      trialStartedAt,
+      trialEndsAt,
+      aiCreditsResetAt,
       defaults: {
         inclusions: [
           'All accommodations as specified',
@@ -47,6 +57,7 @@ router.post('/register', async (req, res) => {
       name,
       email,
       password,
+      phone,
       organization: org._id,
       role: 'owner',
     });
@@ -194,8 +205,9 @@ router.get('/invite/:token', async (req, res) => {
 // Complete invite — set name + password
 router.post('/invite/:token', async (req, res) => {
   try {
-    const { name, password } = req.body;
+    const { name, password, phone } = req.body;
     if (!name || !password) return res.status(400).json({ message: 'Name and password are required' });
+    if (!phone) return res.status(400).json({ message: 'Phone number is required' });
     if (password.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' });
 
     const user = await User.findOne({
@@ -207,6 +219,7 @@ router.post('/invite/:token', async (req, res) => {
 
     user.name = name;
     user.password = password;
+    user.phone = phone;
     user.status = 'active';
     user.emailVerified = true;
     user.inviteToken = undefined;
@@ -360,11 +373,20 @@ router.get('/google/callback', async (req, res) => {
       } else {
         // Create new org + user
         const slug = slugify(googleUser.name || 'workspace', { lower: true, strict: true }) + '-' + Date.now().toString(36);
+        const gTrialStartedAt = new Date();
+        const gTrialEndsAt = new Date(gTrialStartedAt.getTime() + 14 * 24 * 60 * 60 * 1000);
+        const gAiCreditsResetAt = (() => {
+          const d = new Date();
+          return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
+        })();
         const org = await Organization.create({
           name: `${googleUser.name}'s Workspace`,
           slug,
           apiKey: 'sk_' + crypto.randomBytes(24).toString('hex'),
           owner: '000000000000000000000000',
+          trialStartedAt: gTrialStartedAt,
+          trialEndsAt: gTrialEndsAt,
+          aiCreditsResetAt: gAiCreditsResetAt,
           defaults: {
             currency: 'USD',
             marginPercent: 20,

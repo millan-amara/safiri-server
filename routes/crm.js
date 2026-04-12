@@ -2,8 +2,12 @@ import { Router } from 'express';
 import Contact from '../models/Contact.js';
 import { Deal, Pipeline } from '../models/Deal.js';
 import Task from '../models/Task.js';
+import User from '../models/User.js';
+import Organization from '../models/Organization.js';
 import { protect } from '../middleware/auth.js';
 import { triggerAutomation } from '../automations/engine.js';
+import { notifyTaskAssigned, notifyDealAssigned } from '../utils/whatsapp.js';
+import { scheduleTaskReminder, cancelTaskReminder } from '../queues/reminderQueue.js';
 
 const router = Router();
 
@@ -225,6 +229,19 @@ router.post('/deals', protect, async (req, res) => {
       assignedTo: deal.assignedTo,
     });
 
+    // WhatsApp — notify assignee if they have a phone
+    if (deal.assignedTo) {
+      User.findById(deal.assignedTo).select('name phone').lean()
+        .then(assignee => {
+          if (!assignee?.phone) {
+            console.warn(`[WhatsApp] client_assigned skipped — user "${assignee?.name}" has no phone`);
+            return;
+          }
+          return notifyDealAssigned({ to: assignee.phone, userName: assignee.name, dealTitle: deal.title });
+        })
+        .catch(err => console.error('[WhatsApp] notifyDealAssigned failed:', err.message));
+    }
+
     res.status(201).json(populated);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -268,14 +285,18 @@ router.put('/deals/:id', protect, async (req, res) => {
     // Track assignment changes
     if (req.body.assignedTo && req.body.assignedTo.toString() !== existing.assignedTo?.toString()) {
       try {
-        const User = (await import('../models/User.js')).default;
-        const newUser = await User.findById(req.body.assignedTo).select('name');
+        const newUser = await User.findById(req.body.assignedTo).select('name phone');
         const oldUser = existing.assignedTo ? await User.findById(existing.assignedTo).select('name') : null;
         existing.activities.push({
           type: 'assignment_change',
           description: `${req.user.name} reassigned from ${oldUser?.name || 'unassigned'} to ${newUser?.name || 'unknown'}`,
           createdBy: req.user._id,
         });
+        // WhatsApp — notify the newly assigned user
+        if (newUser?.phone) {
+          notifyDealAssigned({ to: newUser.phone, userName: newUser.name, dealTitle: existing.title })
+            .catch(err => console.error('[WhatsApp] notifyDealAssigned (reassign) failed:', err.message));
+        }
       } catch (err) { /* silent */ }
     }
 
@@ -417,6 +438,25 @@ router.post('/tasks', protect, async (req, res) => {
         createdBy: req.user._id,
         dealId: task.deal,
       });
+
+      // WhatsApp — notify assignee if they have a phone
+      User.findById(task.assignedTo).select('name phone').lean()
+        .then(assignee => {
+          if (!assignee?.phone) {
+            console.warn(`[WhatsApp] task_assigned skipped — user "${assignee?.name}" has no phone`);
+            return;
+          }
+          return notifyTaskAssigned({ to: assignee.phone, userName: assignee.name, taskTitle: task.title, dueDate: task.dueDate });
+        })
+        .catch(err => console.error('[WhatsApp] notifyTaskAssigned failed:', err.message));
+    }
+
+    // Schedule WhatsApp reminder
+    if (task.dueDate) {
+      const orgDefault = await Organization.findById(req.organizationId).select('defaults.taskReminderHours').lean();
+      const reminderHours = task.reminderHours ?? orgDefault?.defaults?.taskReminderHours ?? 24;
+      scheduleTaskReminder(task._id, task.dueDate, reminderHours)
+        .catch(err => console.error('[ReminderQueue] schedule failed:', err.message));
     }
 
     res.status(201).json(populated);
@@ -434,6 +474,21 @@ router.put('/tasks/:id', protect, async (req, res) => {
       { new: true }
     ).populate('assignedTo', 'name avatar');
     if (!task) return res.status(404).json({ message: 'Not found' });
+
+    // Cancel existing job then reschedule if task is still active and has a due date
+    const isFinished = ['done', 'cancelled'].includes(task.status);
+    if (isFinished) {
+      cancelTaskReminder(task._id)
+        .catch(err => console.error('[ReminderQueue] cancel failed:', err.message));
+    } else if (task.dueDate) {
+      Organization.findById(req.organizationId).select('defaults.taskReminderHours').lean()
+        .then(org => {
+          const reminderHours = task.reminderHours ?? org?.defaults?.taskReminderHours ?? 24;
+          return scheduleTaskReminder(task._id, task.dueDate, reminderHours);
+        })
+        .catch(err => console.error('[ReminderQueue] reschedule failed:', err.message));
+    }
+
     res.json(task);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -443,6 +498,8 @@ router.put('/tasks/:id', protect, async (req, res) => {
 router.delete('/tasks/:id', protect, async (req, res) => {
   try {
     await Task.findOneAndDelete({ _id: req.params.id, organization: req.organizationId });
+    cancelTaskReminder(req.params.id)
+      .catch(err => console.error('[ReminderQueue] cancel on delete failed:', err.message));
     res.json({ message: 'Deleted' });
   } catch (error) {
     res.status(500).json({ message: error.message });

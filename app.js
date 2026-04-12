@@ -17,7 +17,10 @@ import notificationRoutes from './routes/notifications.js';
 import destinationRoutes from './routes/destinations.js';
 import automationRoutes from './routes/automations.js';
 import webhookRoutes from './routes/webhooks.js';
+import cronRoutes from './routes/cron.js';
+import billingRoutes from './routes/billing.js';
 import { checkInactiveDeals, checkOverdueTasks } from './automations/engine.js';
+import { startReminderWorker } from './queues/reminderQueue.js';
 
 dotenv.config();
 
@@ -26,6 +29,19 @@ const app = express();
 // Middleware
 app.use(helmet());
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true }));
+
+// ── Paystack webhook: capture raw body BEFORE express.json() ─────────────────
+// Paystack signature verification requires the raw request body string.
+// express.raw() reads the body as a Buffer; we convert it and re-attach as req.body
+// so the billing route handler receives a normal parsed object.
+app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), (req, res, next) => {
+  if (Buffer.isBuffer(req.body)) {
+    req.rawBody = req.body.toString('utf8');
+    try { req.body = JSON.parse(req.rawBody); } catch { req.body = {}; }
+  }
+  next();
+});
+
 app.use(express.json({ limit: '10mb' }));
 app.use(morgan('dev'));
 
@@ -42,6 +58,8 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/destinations', destinationRoutes);
 app.use('/api/automations', automationRoutes);
 app.use('/api/webhooks', webhookRoutes);
+app.use('/api/cron', cronRoutes);
+app.use('/api/billing', billingRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
@@ -95,14 +113,42 @@ const start = async () => {
     // Not critical
   }
 
+  // ─── Billing migration: grandfather existing orgs ─────────────────────────
+  // Any org created before billing was introduced has no subscriptionStatus.
+  // Treat them as active Pro accounts so they retain full access.
+  try {
+    const Organization = (await import('./models/Organization.js')).default;
+    const migrated = await Organization.updateMany(
+      { subscriptionStatus: { $exists: false } },
+      {
+        $set: {
+          subscriptionStatus: 'active',
+          plan: 'pro',
+          aiItineraryGenerationsUsed: 0,
+          aiItineraryGenerationsLimit: 20,
+          aiCreditsResetAt: (() => {
+            const d = new Date();
+            return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
+          })(),
+        },
+      }
+    );
+    if (migrated.modifiedCount > 0) {
+      console.log(`Billing migration: grandfathered ${migrated.modifiedCount} existing org(s) as active/pro`);
+    }
+  } catch (e) {
+    console.error('Billing migration failed (non-critical):', e.message);
+  }
+
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 
     // Run scheduled automation checks
-    // Inactive deals — every 6 hours
-    setInterval(checkInactiveDeals, 6 * 60 * 60 * 1000);
-    // Overdue tasks — every hour
-    setInterval(checkOverdueTasks, 60 * 60 * 1000);
+    setInterval(checkInactiveDeals, 6 * 60 * 60 * 1000);  // every 6 hours
+    setInterval(checkOverdueTasks, 60 * 60 * 1000);        // every hour
+
+    // BullMQ worker — processes per-task reminder jobs from Redis
+    startReminderWorker();
   });
 };
 

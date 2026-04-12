@@ -25,7 +25,7 @@ function getTransporter() {
 
 export async function sendEmail({ to, subject, html }) {
   const t = getTransporter();
-  const fromName = process.env.SMTP_FROM_NAME || 'Safari CRM';
+  const fromName = process.env.SMTP_FROM_NAME || 'SafiriPro';
   const from = `"${fromName}" <${process.env.SMTP_USER}>`;
 
   if (!t) {
@@ -64,11 +64,11 @@ function wrap(content, orgName) {
   return `
     <div style="${baseStyle}">
       <div style="text-align: center; margin-bottom: 32px;">
-        <h2 style="margin: 0; color: #1e293b; font-size: 20px;">${orgName || 'Safari CRM'}</h2>
+        <h2 style="margin: 0; color: #1e293b; font-size: 20px;">${orgName || 'SafiriPro'}</h2>
       </div>
       ${content}
       <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #e7e5e4; text-align: center;">
-        <p style="color: #a8a29e; font-size: 12px; margin: 0;">${orgName || 'Safari CRM'}</p>
+        <p style="color: #a8a29e; font-size: 12px; margin: 0;">${orgName || 'SafiriPro'}</p>
       </div>
     </div>
   `;
@@ -78,7 +78,7 @@ export function inviteEmail({ inviterName, orgName, inviteUrl }) {
   return wrap(`
     <h3 style="color: #1e293b; font-size: 18px; margin-bottom: 8px;">You've been invited!</h3>
     <p style="color: #57534e; font-size: 14px; line-height: 1.6;">
-      ${inviterName} has invited you to join <strong>${orgName}</strong> on Safari CRM.
+      ${inviterName} has invited you to join <strong>${orgName}</strong> on SafiriPro.
     </p>
     <p style="color: #57534e; font-size: 14px; line-height: 1.6;">
       Click the button below to set up your account. This link expires in 48 hours.
@@ -115,7 +115,7 @@ export function welcomeEmail({ userName, loginUrl, orgName }) {
       Hi ${userName}, your account is all set up. You can now log in and start working.
     </p>
     <div style="text-align: center; margin: 32px 0;">
-      <a href="${loginUrl}" style="${btnStyle}">Go to Safari CRM</a>
+      <a href="${loginUrl}" style="${btnStyle}">Go to SafiriPro</a>
     </div>
   `, orgName);
 }
@@ -130,7 +130,7 @@ export function verifyEmailTemplate({ userName, verifyUrl }) {
       <a href="${verifyUrl}" style="${btnStyle}">Verify Email</a>
     </div>
     <p style="color: #a8a29e; font-size: 12px;">
-      You can use Safari CRM without verifying, but you may miss email notifications.
+      You can use SafiriPro without verifying, but you may miss email notifications.
     </p>
   `);
 }

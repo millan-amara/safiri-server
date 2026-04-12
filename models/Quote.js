@@ -154,6 +154,10 @@ const quoteSchema = new mongoose.Schema({
   
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   
+  // PDF style preset — controls typography, accents, cover treatment
+  pdfStyle: { type: String, enum: ['editorial', 'modern', 'minimal'], default: 'editorial' },
+  coverLayout: { type: String, enum: ['full_bleed', 'split', 'band'], default: 'full_bleed' },
+
   // Branding snapshot (in case org branding changes later)
   brandingSnapshot: {
     logo: String,
@@ -163,6 +167,9 @@ const quoteSchema = new mongoose.Schema({
     companyEmail: String,
     companyPhone: String,
     companyAddress: String,
+    aboutUs: String,
+    coverQuote: String,
+    coverQuoteAuthor: String,
   },
 }, { timestamps: true });
 

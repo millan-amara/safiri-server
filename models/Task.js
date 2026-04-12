@@ -18,6 +18,8 @@ const taskSchema = new mongoose.Schema({
   status: { type: String, enum: ['todo', 'in_progress', 'done', 'cancelled'], default: 'todo' },
   
   completedAt: Date,
+  reminderHours: { type: Number, default: null }, // null = use org default, 0 = no reminder
+  overdueNotifiedAt: { type: Date, default: null }, // set when overdue WhatsApp is sent — prevents repeat firing
 }, { timestamps: true });
 
 taskSchema.index({ organization: 1, assignedTo: 1, status: 1 });

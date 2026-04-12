@@ -1,7 +1,27 @@
 import { Router } from 'express';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { protect } from '../middleware/auth.js';
+import { checkAiItineraryQuota } from '../middleware/subscription.js';
+import { logAiCall } from '../utils/aiLogger.js';
 
 const router = Router();
+
+// Apply auth to all AI routes (no public endpoints in this router)
+router.use(protect);
+
+// Rate limit: 10 AI calls per minute per organization (keyed on org ID, not IP,
+// so shared IPs in offices don't pool limits across different orgs).
+const aiRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyGenerator: (req, res) => req.organizationId?.toString() || ipKeyGenerator(req, res),
+  message: { message: 'Too many AI requests. Please slow down and try again in a moment.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: () => process.env.NODE_ENV === 'test', // don't rate-limit in automated tests
+});
+
+router.use(aiRateLimiter);
 
 // Helper to call Claude API
 async function callClaude(systemPrompt, userMessage, maxTokens = 1024) {
@@ -34,7 +54,7 @@ async function callClaude(systemPrompt, userMessage, maxTokens = 1024) {
 
 // ─── GENERATE SEGMENT NARRATIVES ──────────────────
 
-router.post('/generate-narrative', protect, async (req, res) => {
+router.post('/generate-narrative', logAiCall('generate-narrative'), async (req, res) => {
   try {
     const { destination, hotel, activities, nights, dayNumber, isFirst, travelers } = req.body;
 
@@ -68,7 +88,7 @@ Return ONLY the narrative text, nothing else.`;
 
 // ─── GENERATE ALL SEGMENT NARRATIVES AT ONCE ──────
 
-router.post('/generate-all-narratives', protect, async (req, res) => {
+router.post('/generate-all-narratives', checkAiItineraryQuota, logAiCall('generate-all-narratives'), async (req, res) => {
   try {
     const { segments, tripTitle, travelers } = req.body;
 
@@ -123,7 +143,7 @@ Respond ONLY with this JSON structure:
 
 // ─── AI DEAL SUMMARY ────────────────────────────
 
-router.post('/deal-summary', protect, async (req, res) => {
+router.post('/deal-summary', logAiCall('deal-summary'), async (req, res) => {
   try {
     const { deal, activities, quotes } = req.body;
 
@@ -152,7 +172,7 @@ Provide a brief summary and suggest the best next action.`;
 
 // ─── AI EMAIL DRAFTING ──────────────────────────
 
-router.post('/draft-email', protect, async (req, res) => {
+router.post('/draft-email', logAiCall('draft-email'), async (req, res) => {
   try {
     const { context, type, recipientName, senderName, companyName } = req.body;
 
@@ -182,7 +202,7 @@ Return ONLY the email body (no subject line).`;
 
 // ─── AI CSV COLUMN MAPPING ──────────────────────
 
-router.post('/map-columns', protect, async (req, res) => {
+router.post('/map-columns', logAiCall('map-columns'), async (req, res) => {
   try {
     const { sourceColumns, sampleRows } = req.body;
 
@@ -226,7 +246,7 @@ Respond ONLY with JSON:
 
 // ─── AI ROUTE SUGGESTION ────────────────────────
 
-router.post('/suggest-route', protect, async (req, res) => {
+router.post('/suggest-route', logAiCall('suggest-route'), async (req, res) => {
   console.log('Route suggestion request:', JSON.stringify(req.body).substring(0, 200));
   try {
     const { landingCity, tripLength, interests, budget, destinations, travelers, tourType } = req.body;
@@ -274,7 +294,7 @@ Respond ONLY with this JSON structure, nothing else:
 
 // ─── DRAFT FULL ITINERARY FROM PROMPT ─────────────
 
-router.post('/draft-itinerary', protect, async (req, res) => {
+router.post('/draft-itinerary', checkAiItineraryQuota, logAiCall('draft-itinerary'), async (req, res) => {
   try {
     const { prompt, tripLength, travelers, budget } = req.body;
     if (!prompt?.trim()) return res.status(400).json({ message: 'Prompt required' });

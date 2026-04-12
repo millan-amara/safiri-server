@@ -11,6 +11,8 @@ const organizationSchema = new mongoose.Schema({
     secondaryColor: { type: String, default: '#1E293B' },
     accentColor: { type: String, default: '#059669' },
     fontFamily: { type: String, default: 'Inter' },
+    coverQuote: { type: String, default: '' },           // Shown on PDF/link closing page
+    coverQuoteAuthor: { type: String, default: '' },
   },
   
   // Business info (appears on quotes)
@@ -31,10 +33,41 @@ const organizationSchema = new mongoose.Schema({
     paymentTerms: { type: String, default: '40% deposit, 60% balance due 30 days before tour.' },
     inclusions: [{ type: String }],
     exclusions: [{ type: String }],
+    taskReminderHours: { type: Number, default: 24 },
   },
 
-  // Subscription / plan (for future monetization)
-  plan: { type: String, enum: ['free', 'starter', 'pro', 'enterprise'], default: 'free' },
+  // ─── Subscription & billing ────────────────────────────────────────────────
+  subscriptionStatus: {
+    type: String,
+    enum: ['trialing', 'active', 'past_due', 'expired', 'cancelled'],
+    default: 'trialing',
+  },
+  plan: {
+    type: String,
+    enum: ['trial', 'pro', 'business', 'enterprise'],
+    default: 'trial',
+  },
+
+  // Trial window
+  trialStartedAt: { type: Date, default: Date.now },
+  trialEndsAt: { type: Date },           // set on org creation: trialStartedAt + 14 days
+  trialQuoteCount: { type: Number, default: 0 },
+  trialQuoteLimit: { type: Number, default: 10 },
+
+  // Paid billing period
+  currentPeriodEnd: { type: Date },      // when the current paid period ends
+
+  // Paystack identifiers
+  paystackCustomerCode: { type: String },
+  paystackSubscriptionCode: { type: String },
+
+  // AI usage (resets monthly)
+  aiItineraryGenerationsUsed: { type: Number, default: 0 },
+  aiItineraryGenerationsLimit: { type: Number, default: 20 }, // 20 for trial/pro, unlimited (999999) for business
+  aiCreditsResetAt: { type: Date },      // 1st of next month — set on org creation & each reset
+
+  // Business plan feature
+  whiteLabel: { type: Boolean, default: false }, // hides "Powered by SafiriPro" on quote share pages
   
   // n8n automation endpoint
   webhookUrl: { type: String, default: '' },
