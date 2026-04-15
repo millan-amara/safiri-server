@@ -1,30 +1,35 @@
 import { Router } from 'express';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { protect } from '../middleware/auth.js';
-import { checkAiItineraryQuota } from '../middleware/subscription.js';
+import { checkAiCredits } from '../middleware/subscription.js';
 import { logAiCall } from '../utils/aiLogger.js';
+import { AI_CREDIT_COST, getPlan } from '../config/plans.js';
+
+const heavy  = checkAiCredits(AI_CREDIT_COST.heavy);
+const medium = checkAiCredits(AI_CREDIT_COST.medium);
+const light  = checkAiCredits(AI_CREDIT_COST.light);
 
 const router = Router();
 
 // Apply auth to all AI routes (no public endpoints in this router)
 router.use(protect);
 
-// Rate limit: 10 AI calls per minute per organization (keyed on org ID, not IP,
-// so shared IPs in offices don't pool limits across different orgs).
+// Plan-aware rate limit: Starter 5/min, Pro 10, Business 20, Enterprise 30.
+// Keyed on org ID so shared office IPs don't pool limits across orgs.
 const aiRateLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 10,
+  max: (req) => getPlan(req.organization?.plan).aiRateLimitPerMin,
   keyGenerator: (req, res) => req.organizationId?.toString() || ipKeyGenerator(req, res),
   message: { message: 'Too many AI requests. Please slow down and try again in a moment.' },
   standardHeaders: true,
   legacyHeaders: false,
-  skip: () => process.env.NODE_ENV === 'test', // don't rate-limit in automated tests
+  skip: () => process.env.NODE_ENV === 'test',
 });
 
 router.use(aiRateLimiter);
 
 // Helper to call Claude API
-async function callClaude(systemPrompt, userMessage, maxTokens = 1024) {
+async function callClaude(systemPrompt, userMessage, maxTokens = 1024, model = 'claude-sonnet-4-20250514') {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
 
@@ -36,7 +41,7 @@ async function callClaude(systemPrompt, userMessage, maxTokens = 1024) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model,
       max_tokens: maxTokens,
       system: systemPrompt,
       messages: [{ role: 'user', content: userMessage }],
@@ -54,7 +59,7 @@ async function callClaude(systemPrompt, userMessage, maxTokens = 1024) {
 
 // ─── GENERATE SEGMENT NARRATIVES ──────────────────
 
-router.post('/generate-narrative', logAiCall('generate-narrative'), async (req, res) => {
+router.post('/generate-narrative', medium, logAiCall('generate-narrative'), async (req, res) => {
   try {
     const { destination, hotel, activities, nights, dayNumber, isFirst, travelers } = req.body;
 
@@ -88,7 +93,7 @@ Return ONLY the narrative text, nothing else.`;
 
 // ─── GENERATE ALL SEGMENT NARRATIVES AT ONCE ──────
 
-router.post('/generate-all-narratives', checkAiItineraryQuota, logAiCall('generate-all-narratives'), async (req, res) => {
+router.post('/generate-all-narratives', heavy, logAiCall('generate-all-narratives'), async (req, res) => {
   try {
     const { segments, tripTitle, travelers } = req.body;
 
@@ -143,7 +148,7 @@ Respond ONLY with this JSON structure:
 
 // ─── AI DEAL SUMMARY ────────────────────────────
 
-router.post('/deal-summary', logAiCall('deal-summary'), async (req, res) => {
+router.post('/deal-summary', light, logAiCall('deal-summary'), async (req, res) => {
   try {
     const { deal, activities, quotes } = req.body;
 
@@ -172,7 +177,7 @@ Provide a brief summary and suggest the best next action.`;
 
 // ─── AI EMAIL DRAFTING ──────────────────────────
 
-router.post('/draft-email', logAiCall('draft-email'), async (req, res) => {
+router.post('/draft-email', light, logAiCall('draft-email'), async (req, res) => {
   try {
     const { context, type, recipientName, senderName, companyName } = req.body;
 
@@ -202,7 +207,7 @@ Return ONLY the email body (no subject line).`;
 
 // ─── AI CSV COLUMN MAPPING ──────────────────────
 
-router.post('/map-columns', logAiCall('map-columns'), async (req, res) => {
+router.post('/map-columns', light, logAiCall('map-columns'), async (req, res) => {
   try {
     const { sourceColumns, sampleRows } = req.body;
 
@@ -246,7 +251,7 @@ Respond ONLY with JSON:
 
 // ─── AI ROUTE SUGGESTION ────────────────────────
 
-router.post('/suggest-route', logAiCall('suggest-route'), async (req, res) => {
+router.post('/suggest-route', medium, logAiCall('suggest-route'), async (req, res) => {
   console.log('Route suggestion request:', JSON.stringify(req.body).substring(0, 200));
   try {
     const { landingCity, tripLength, interests, budget, destinations, travelers, tourType } = req.body;
@@ -294,19 +299,86 @@ Respond ONLY with this JSON structure, nothing else:
 
 // ─── DRAFT FULL ITINERARY FROM PROMPT ─────────────
 
-router.post('/draft-itinerary', checkAiItineraryQuota, logAiCall('draft-itinerary'), async (req, res) => {
+router.post('/draft-itinerary', heavy, logAiCall('draft-itinerary'), async (req, res) => {
   try {
     const { prompt, tripLength, travelers, budget } = req.body;
     if (!prompt?.trim()) return res.status(400).json({ message: 'Prompt required' });
 
-    // Pull the operator's partner data so the AI can suggest real hotels/activities
+    // Pull the operator's partner data so the AI can suggest real hotels/activities.
+    // Pre-filter by destinations mentioned in the prompt so the prompt stays bounded
+    // even for orgs with thousands of records — keeps Claude costs predictable.
     const Hotel = (await import('../models/Hotel.js')).default;
     const Activity = (await import('../models/Activity.js')).default;
+    const Destination = (await import('../models/Destination.js')).default;
 
-    const hotels = await Hotel.find({ organization: req.organizationId, isActive: true })
-      .select('name destination category description rates').lean();
-    const activities = await Activity.find({ organization: req.organizationId, isActive: true })
-      .select('name destination description costPerPerson groupRate').lean();
+    const MAX_CATALOG_PER_TYPE = 60;
+
+    // Build the destination vocabulary from the org's Hotels and Activities (authoritative —
+    // these are what the operator actually has inventory for) plus the Destinations collection.
+    const orgScope = { organization: req.organizationId, isActive: true };
+    const [destRecords, hotelDests, actDests] = await Promise.all([
+      Destination.find(orgScope).select('name').lean(),
+      Hotel.distinct('destination', orgScope),
+      Activity.distinct('destination', orgScope),
+    ]);
+    const vocab = [...new Set(
+      [...destRecords.map(d => d.name), ...hotelDests, ...actDests]
+        .filter(Boolean)
+        .map(s => s.trim())
+    )];
+
+    // Use Haiku to semantically match the user's free-text prompt against the operator's
+    // destination vocabulary. Handles synonyms ("beach" → "Diani"), abbreviations ("Mara"
+    // → "Maasai Mara"), and thematic intent ("safari" → Mara/Amboseli/Samburu).
+    // Costs ~$0.001 per call — negligible vs the main itinerary call.
+    let matchedDestinations = [];
+    if (vocab.length > 0) {
+      try {
+        const extractorSystem = `You match a user's travel request to destinations the operator services. You MUST respond with valid JSON only — no markdown, no commentary. Return the EXACT names from the provided list (case-sensitive, including spelling). If the user's request is vague (e.g. "beach", "safari"), pick all reasonable thematic matches. If nothing matches, return an empty array.`;
+        const extractorPrompt = `Operator's destinations: ${JSON.stringify(vocab)}
+
+User request: "${prompt}"${tripLength ? `\nTrip length: ${tripLength} days` : ''}${budget ? `\nBudget: ${budget}` : ''}
+
+Respond ONLY with JSON: { "destinations": ["ExactName1", "ExactName2"] }`;
+        const extractorRaw = await callClaude(extractorSystem, extractorPrompt, 300, 'claude-haiku-4-5-20251001');
+        const cleaned = extractorRaw.replace(/```json\s*|\s*```/g, '').trim();
+        const start = cleaned.indexOf('{');
+        const end = cleaned.lastIndexOf('}');
+        if (start !== -1 && end !== -1) {
+          const parsed = JSON.parse(cleaned.substring(start, end + 1));
+          matchedDestinations = (parsed.destinations || []).filter(name => vocab.includes(name));
+        }
+      } catch (e) {
+        console.warn('[draft-itinerary] destination extractor failed, falling back to substring match:', e.message);
+        const promptLower = prompt.toLowerCase();
+        matchedDestinations = vocab.filter(name => promptLower.includes(name.toLowerCase()));
+      }
+    }
+
+    // If nothing matches, send an empty catalog. Claude will produce a valid plan skeleton
+    // with null hotels/empty activities — honest signal that inventory is missing, rather
+    // than silently suggesting mismatched hotels.
+    const noMatch = matchedDestinations.length === 0;
+    const hotelFilter = { ...orgScope };
+    const activityFilter = { ...orgScope };
+    if (noMatch) {
+      hotelFilter._id = null;
+      activityFilter._id = null;
+    } else {
+      hotelFilter.destination = { $in: matchedDestinations };
+      activityFilter.destination = { $in: matchedDestinations };
+    }
+
+    const hotels = await Hotel.find(hotelFilter)
+      .select('name destination category description rates')
+      .sort({ updatedAt: -1 })
+      .limit(MAX_CATALOG_PER_TYPE)
+      .lean();
+    const activities = await Activity.find(activityFilter)
+      .select('name destination description costPerPerson groupRate')
+      .sort({ updatedAt: -1 })
+      .limit(MAX_CATALOG_PER_TYPE)
+      .lean();
 
     // Build a compact catalog the AI can reference by name
     const hotelCatalog = hotels.map(h => ({
@@ -433,11 +505,19 @@ Generate the full itinerary as JSON.`;
       };
     });
 
+    // Surface catalog-match context so the UI can show the operator exactly what we
+    // pulled from their inventory (and hint when something they asked for wasn't found).
     res.json({
       title: parsed.title || '',
       coverNarrative: parsed.coverNarrative || '',
       highlights: parsed.highlights || [],
       days: resolvedDays,
+      catalog: {
+        matchedDestinations,
+        hotelsUsed: hotels.length,
+        activitiesUsed: activities.length,
+        emptyCatalog: noMatch,
+      },
     });
   } catch (error) {
     console.error('Draft itinerary error:', error.message);

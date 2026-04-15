@@ -1,6 +1,7 @@
 import { Queue, Worker } from 'bullmq';
 import Task from '../models/Task.js';
-import { notifyTaskReminder } from '../utils/whatsapp.js';
+import Organization from '../models/Organization.js';
+import { notify } from '../utils/notify.js';
 
 // Read env vars lazily — called after dotenv.config() has run
 function getConnection() {
@@ -61,22 +62,20 @@ export function startReminderWorker() {
     'task-reminders',
     async (job) => {
       const { taskId } = job.data;
-      const task = await Task.findById(taskId).populate('assignedTo', 'name phone');
+      const task = await Task.findById(taskId).populate('assignedTo', 'name phone email');
 
       if (!task) return;                                          // deleted
       if (['done', 'cancelled'].includes(task.status)) return;   // completed before reminder fired
-      if (!task.dueDate) return;
+      if (!task.dueDate || !task.assignedTo) return;
 
-      if (!task.assignedTo?.phone) {
-        console.warn(`[ReminderQueue] Skipped — assignee of "${task.title}" has no phone`);
-        return;
-      }
+      // Look up the org plan so notify() can pick WhatsApp vs email.
+      const org = await Organization.findById(task.organization).select('plan').lean();
 
-      await notifyTaskReminder({
-        to: task.assignedTo.phone,
-        userName: task.assignedTo.name,
-        taskTitle: task.title,
-        dueDate: task.dueDate,
+      await notify({
+        plan: org?.plan,
+        user: task.assignedTo,
+        type: 'task_reminder',
+        payload: { taskTitle: task.title, dueDate: task.dueDate },
       });
     },
     { connection: getConnection() }

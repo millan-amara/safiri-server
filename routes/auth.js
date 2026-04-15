@@ -3,9 +3,10 @@ import crypto from 'crypto';
 import User from '../models/User.js';
 import Organization from '../models/Organization.js';
 import { Pipeline } from '../models/Deal.js';
-import { protect, generateToken } from '../middleware/auth.js';
+import { protect, generateToken, isSuperAdminEmail } from '../middleware/auth.js';
 import { sendEmail, resetPasswordEmail, welcomeEmail, verifyEmailTemplate } from '../utils/email.js';
 import slugify from 'slugify';
+import { PLANS, nextMonthlyResetDate } from '../config/plans.js';
 
 const router = Router();
 
@@ -20,10 +21,8 @@ router.post('/register', async (req, res) => {
     const apiKey = 'sk_' + crypto.randomBytes(24).toString('hex');
     const trialStartedAt = new Date();
     const trialEndsAt = new Date(trialStartedAt.getTime() + 14 * 24 * 60 * 60 * 1000);
-    const aiCreditsResetAt = (() => {
-      const d = new Date();
-      return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)); // 1st of next month
-    })();
+    const trialPlan = PLANS.trial;
+    const aiCreditsResetAt = nextMonthlyResetDate();
     const org = await Organization.create({
       name: companyName || `${name}'s Organization`,
       slug,
@@ -31,7 +30,10 @@ router.post('/register', async (req, res) => {
       owner: '000000000000000000000000', // placeholder
       trialStartedAt,
       trialEndsAt,
+      aiCreditsLimit: trialPlan.aiCredits,
       aiCreditsResetAt,
+      quotesMonthResetAt: aiCreditsResetAt,
+      trialQuoteLimit: trialPlan.quotesPerMonth,
       defaults: {
         inclusions: [
           'All accommodations as specified',
@@ -123,7 +125,7 @@ router.post('/login', async (req, res) => {
     const org = await Organization.findById(user.organization);
     const token = generateToken(user._id);
     
-    res.json({ token, user: { ...user.toObject(), password: undefined }, organization: org });
+    res.json({ token, user: { ...user.toObject(), password: undefined, isSuperAdmin: isSuperAdminEmail(user.email) }, organization: org });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -138,7 +140,9 @@ router.get('/me', protect, async (req, res) => {
       org.apiKey = 'sk_' + crypto.randomBytes(24).toString('hex');
       await org.save();
     }
-    res.json({ user: req.user, organization: org });
+    const userObj = req.user.toObject ? req.user.toObject() : req.user;
+    userObj.isSuperAdmin = isSuperAdminEmail(userObj.email);
+    res.json({ user: userObj, organization: org });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -375,10 +379,8 @@ router.get('/google/callback', async (req, res) => {
         const slug = slugify(googleUser.name || 'workspace', { lower: true, strict: true }) + '-' + Date.now().toString(36);
         const gTrialStartedAt = new Date();
         const gTrialEndsAt = new Date(gTrialStartedAt.getTime() + 14 * 24 * 60 * 60 * 1000);
-        const gAiCreditsResetAt = (() => {
-          const d = new Date();
-          return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
-        })();
+        const gAiCreditsResetAt = nextMonthlyResetDate();
+        const gTrialPlan = PLANS.trial;
         const org = await Organization.create({
           name: `${googleUser.name}'s Workspace`,
           slug,
@@ -386,7 +388,10 @@ router.get('/google/callback', async (req, res) => {
           owner: '000000000000000000000000',
           trialStartedAt: gTrialStartedAt,
           trialEndsAt: gTrialEndsAt,
+          aiCreditsLimit: gTrialPlan.aiCredits,
           aiCreditsResetAt: gAiCreditsResetAt,
+          quotesMonthResetAt: gAiCreditsResetAt,
+          trialQuoteLimit: gTrialPlan.quotesPerMonth,
           defaults: {
             currency: 'USD',
             marginPercent: 20,

@@ -5,6 +5,13 @@ import { protect, authorize } from '../middleware/auth.js';
 
 import { sendEmail, inviteEmail } from '../utils/email.js';
 import crypto from 'crypto';
+import { PLANS, UNLIMITED } from '../config/plans.js';
+
+// Fields on the org doc that are controlled by the user's plan, not editable directly.
+// Stripped from any PUT /organization payload so a client can't grant itself paid features.
+const PLAN_CONTROLLED_FIELDS = ['plan', 'subscriptionStatus', 'aiCreditsLimit', 'aiCreditsUsed',
+  'whiteLabel', 'currentPeriodEnd', 'paystackCustomerCode', 'paystackSubscriptionCode',
+  'paystackAuthorizationCode', 'pendingPlan', 'annual', 'trialQuoteLimit', 'quotesThisMonth'];
 
 const router = Router();
 
@@ -40,7 +47,15 @@ router.get('/organization', protect, async (req, res) => {
 
 router.put('/organization', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
-    const org = await Organization.findByIdAndUpdate(req.organizationId, req.body, { new: true });
+    const update = { ...req.body };
+    for (const f of PLAN_CONTROLLED_FIELDS) delete update[f];
+
+    // webhookUrl is a paid-plan feature — silently ignore the field on plans without it
+    // rather than 403, so unrelated profile saves don't fail.
+    const planConfig = PLANS[req.organization?.plan] || PLANS.trial;
+    if (!planConfig.webhooks) delete update.webhookUrl;
+
+    const org = await Organization.findByIdAndUpdate(req.organizationId, update, { new: true });
     res.json(org);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -75,14 +90,15 @@ router.post('/team/invite', protect, authorize('owner', 'admin'), async (req, re
     const { email, role = 'agent' } = req.body;
     if (!email) return res.status(400).json({ message: 'Email is required' });
 
-    // Pro and Trial plans are capped at 6 team members. Business and Enterprise are unlimited.
-    const org = req.organization; // cached by protect
-    if (org && (org.plan === 'pro' || org.plan === 'trial')) {
+    // Per-plan seat cap. Trial 2, Starter 2, Pro 8, Business 25, Enterprise unlimited.
+    const planConfig = PLANS[req.organization?.plan] || PLANS.trial;
+    const seatCap = planConfig.seats;
+    if (seatCap !== UNLIMITED) {
       const memberCount = await User.countDocuments({ organization: req.organizationId });
-      if (memberCount >= 6) {
+      if (memberCount >= seatCap) {
         return res.status(403).json({
-          message: 'Your plan supports up to 6 team members. Upgrade to Business for unlimited members.',
-          memberLimit: 6,
+          message: `Your ${planConfig.label} plan supports up to ${seatCap} team members. Upgrade for more seats.`,
+          memberLimit: seatCap,
           memberCount,
           code: 'TEAM_MEMBER_LIMIT',
         });

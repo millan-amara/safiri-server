@@ -74,6 +74,20 @@ export async function verifyTransaction(reference) {
   return paystackRequest('GET', `/transaction/verify/${encodeURIComponent(reference)}`);
 }
 
+/**
+ * Charge a previously-saved authorization (card token).
+ * Used by the scheduled-downgrade cron to auto-charge the new plan at period end
+ * without requiring the user to re-enter card details.
+ */
+export async function chargeAuthorization(email, amount, authorizationCode, metadata = {}) {
+  return paystackRequest('POST', '/transaction/charge_authorization', {
+    email,
+    amount,
+    authorization_code: authorizationCode,
+    metadata,
+  });
+}
+
 // ─── SUBSCRIPTIONS ────────────────────────────────────────────────────────────
 
 /**

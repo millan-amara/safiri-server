@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import Destination from '../models/Destination.js';
 import { protect } from '../middleware/auth.js';
+import { requirePartnerQuota, enforceImageCap } from '../middleware/partnerQuota.js';
 
 const router = Router();
 
@@ -32,7 +33,7 @@ router.get('/:id', protect, async (req, res) => {
 });
 
 // Create
-router.post('/', protect, async (req, res) => {
+router.post('/', protect, requirePartnerQuota('destination'), enforceImageCap, async (req, res) => {
   try {
     const dest = await Destination.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(dest);
@@ -42,7 +43,7 @@ router.post('/', protect, async (req, res) => {
 });
 
 // Update
-router.put('/:id', protect, async (req, res) => {
+router.put('/:id', protect, enforceImageCap, async (req, res) => {
   try {
     const dest = await Destination.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },

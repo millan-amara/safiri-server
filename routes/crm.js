@@ -6,8 +6,9 @@ import User from '../models/User.js';
 import Organization from '../models/Organization.js';
 import { protect } from '../middleware/auth.js';
 import { triggerAutomation } from '../automations/engine.js';
-import { notifyTaskAssigned, notifyDealAssigned } from '../utils/whatsapp.js';
 import { scheduleTaskReminder, cancelTaskReminder } from '../queues/reminderQueue.js';
+import { notify } from '../utils/notify.js';
+import { requirePipelineQuota, requireTrialContactQuota } from '../middleware/partnerQuota.js';
 
 const router = Router();
 
@@ -62,7 +63,7 @@ router.get('/contacts/:id', protect, async (req, res) => {
   }
 });
 
-router.post('/contacts', protect, async (req, res) => {
+router.post('/contacts', protect, requireTrialContactQuota, async (req, res) => {
   try {
     const contact = await Contact.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(contact);
@@ -108,7 +109,7 @@ router.get('/pipelines', protect, async (req, res) => {
   }
 });
 
-router.post('/pipelines', protect, async (req, res) => {
+router.post('/pipelines', protect, requirePipelineQuota, async (req, res) => {
   try {
     const pipeline = await Pipeline.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(pipeline);
@@ -232,14 +233,13 @@ router.post('/deals', protect, async (req, res) => {
     // WhatsApp — notify assignee if they have a phone
     if (deal.assignedTo) {
       User.findById(deal.assignedTo).select('name phone').lean()
-        .then(assignee => {
-          if (!assignee?.phone) {
-            console.warn(`[WhatsApp] client_assigned skipped — user "${assignee?.name}" has no phone`);
-            return;
-          }
-          return notifyDealAssigned({ to: assignee.phone, userName: assignee.name, dealTitle: deal.title });
-        })
-        .catch(err => console.error('[WhatsApp] notifyDealAssigned failed:', err.message));
+        .then(assignee => notify({
+          plan: req.organization?.plan,
+          user: assignee,
+          type: 'deal_assigned',
+          payload: { dealTitle: deal.title },
+        }))
+        .catch(err => console.error('[notify] deal_assigned failed:', err.message));
     }
 
     res.status(201).json(populated);
@@ -293,9 +293,13 @@ router.put('/deals/:id', protect, async (req, res) => {
           createdBy: req.user._id,
         });
         // WhatsApp — notify the newly assigned user
-        if (newUser?.phone) {
-          notifyDealAssigned({ to: newUser.phone, userName: newUser.name, dealTitle: existing.title })
-            .catch(err => console.error('[WhatsApp] notifyDealAssigned (reassign) failed:', err.message));
+        if (newUser) {
+          notify({
+            plan: req.organization?.plan,
+            user: newUser,
+            type: 'deal_assigned',
+            payload: { dealTitle: existing.title },
+          }).catch(err => console.error('[notify] deal_assigned (reassign) failed:', err.message));
         }
       } catch (err) { /* silent */ }
     }
@@ -441,14 +445,13 @@ router.post('/tasks', protect, async (req, res) => {
 
       // WhatsApp — notify assignee if they have a phone
       User.findById(task.assignedTo).select('name phone').lean()
-        .then(assignee => {
-          if (!assignee?.phone) {
-            console.warn(`[WhatsApp] task_assigned skipped — user "${assignee?.name}" has no phone`);
-            return;
-          }
-          return notifyTaskAssigned({ to: assignee.phone, userName: assignee.name, taskTitle: task.title, dueDate: task.dueDate });
-        })
-        .catch(err => console.error('[WhatsApp] notifyTaskAssigned failed:', err.message));
+        .then(assignee => notify({
+          plan: req.organization?.plan,
+          user: assignee,
+          type: 'task_assigned',
+          payload: { taskTitle: task.title, dueDate: task.dueDate },
+        }))
+        .catch(err => console.error('[notify] task_assigned failed:', err.message));
     }
 
     // Schedule WhatsApp reminder

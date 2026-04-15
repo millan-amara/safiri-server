@@ -28,6 +28,7 @@
     "passport-google-oauth20": "^2.0.0",
     "passport-local": "^1.0.0",
     "puppeteer": "^24.40.0",
+    "resend": "^6.11.0",
     "slugify": "^1.6.8",
     "xlsx": "^0.18.5"
   }

@@ -19,6 +19,7 @@ import automationRoutes from './routes/automations.js';
 import webhookRoutes from './routes/webhooks.js';
 import cronRoutes from './routes/cron.js';
 import billingRoutes from './routes/billing.js';
+import libraryRoutes from './routes/library.js';
 import { checkInactiveDeals, checkOverdueTasks } from './automations/engine.js';
 import { startReminderWorker } from './queues/reminderQueue.js';
 
@@ -60,6 +61,7 @@ app.use('/api/automations', automationRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.use('/api/cron', cronRoutes);
 app.use('/api/billing', billingRoutes);
+app.use('/api/library', libraryRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
@@ -113,32 +115,6 @@ const start = async () => {
     // Not critical
   }
 
-  // ─── Billing migration: grandfather existing orgs ─────────────────────────
-  // Any org created before billing was introduced has no subscriptionStatus.
-  // Treat them as active Pro accounts so they retain full access.
-  try {
-    const Organization = (await import('./models/Organization.js')).default;
-    const migrated = await Organization.updateMany(
-      { subscriptionStatus: { $exists: false } },
-      {
-        $set: {
-          subscriptionStatus: 'active',
-          plan: 'pro',
-          aiItineraryGenerationsUsed: 0,
-          aiItineraryGenerationsLimit: 20,
-          aiCreditsResetAt: (() => {
-            const d = new Date();
-            return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1));
-          })(),
-        },
-      }
-    );
-    if (migrated.modifiedCount > 0) {
-      console.log(`Billing migration: grandfathered ${migrated.modifiedCount} existing org(s) as active/pro`);
-    }
-  } catch (e) {
-    console.error('Billing migration failed (non-critical):', e.message);
-  }
 
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);

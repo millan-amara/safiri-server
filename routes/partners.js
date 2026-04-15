@@ -6,6 +6,13 @@ import Transport from '../models/Transport.js';
 import Activity from '../models/Activity.js';
 import Destination from '../models/Destination.js';
 import { protect } from '../middleware/auth.js';
+import { requirePartnerQuota, enforceImageCap, enforceCsvRowCap } from '../middleware/partnerQuota.js';
+
+// Counts total rows across all sheets in an XLSX/CSV workbook.
+const xlsxRowCounter = (file) => {
+  const wb = XLSX.read(file.buffer, { type: 'buffer' });
+  return wb.SheetNames.reduce((sum, sheet) => sum + XLSX.utils.sheet_to_json(wb.Sheets[sheet]).length, 0);
+};
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -41,7 +48,7 @@ router.get('/hotels/:id', protect, async (req, res) => {
   }
 });
 
-router.post('/hotels', protect, async (req, res) => {
+router.post('/hotels', protect, requirePartnerQuota('hotel'), enforceImageCap, async (req, res) => {
   try {
     // Auto-create destination if needed
     if (req.body.destination) {
@@ -57,7 +64,7 @@ router.post('/hotels', protect, async (req, res) => {
   }
 });
 
-router.put('/hotels/:id', protect, async (req, res) => {
+router.put('/hotels/:id', protect, enforceImageCap, async (req, res) => {
   try {
     const hotel = await Hotel.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -95,7 +102,7 @@ router.get('/transport', protect, async (req, res) => {
   }
 });
 
-router.post('/transport', protect, async (req, res) => {
+router.post('/transport', protect, requirePartnerQuota('transport'), enforceImageCap, async (req, res) => {
   try {
     const t = await Transport.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(t);
@@ -104,7 +111,7 @@ router.post('/transport', protect, async (req, res) => {
   }
 });
 
-router.put('/transport/:id', protect, async (req, res) => {
+router.put('/transport/:id', protect, enforceImageCap, async (req, res) => {
   try {
     const t = await Transport.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -145,7 +152,7 @@ router.get('/activities', protect, async (req, res) => {
   }
 });
 
-router.post('/activities', protect, async (req, res) => {
+router.post('/activities', protect, requirePartnerQuota('activity'), enforceImageCap, async (req, res) => {
   try {
     const a = await Activity.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(a);
@@ -154,7 +161,7 @@ router.post('/activities', protect, async (req, res) => {
   }
 });
 
-router.put('/activities/:id', protect, async (req, res) => {
+router.put('/activities/:id', protect, enforceImageCap, async (req, res) => {
   try {
     const a = await Activity.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -182,7 +189,7 @@ router.delete('/activities/:id', protect, async (req, res) => {
 
 // ─── SPREADSHEET IMPORT ────────────────────────────────
 
-router.post('/import', protect, upload.single('file'), async (req, res) => {
+router.post('/import', protect, upload.single('file'), enforceCsvRowCap(xlsxRowCounter), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 

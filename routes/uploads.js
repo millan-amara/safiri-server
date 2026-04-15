@@ -6,6 +6,7 @@ import Hotel from '../models/Hotel.js';
 import Activity from '../models/Activity.js';
 import Transport from '../models/Transport.js';
 import Organization from '../models/Organization.js';
+import { enforceCsvRowCap } from '../middleware/partnerQuota.js';
 
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -159,7 +160,12 @@ router.delete('/image', protect, async (req, res) => {
 
 // ─── CONTACT CSV IMPORT (with AI column mapping) ─
 
-router.post('/contacts-csv', protect, upload.single('file'), async (req, res) => {
+const csvRowCounter = (file) => {
+  const text = file.buffer.toString('utf-8');
+  return text.split('\n').filter(l => l.trim()).length - 1; // minus header
+};
+
+router.post('/contacts-csv', protect, upload.single('file'), enforceCsvRowCap(csvRowCounter), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
@@ -188,7 +194,7 @@ router.post('/contacts-csv', protect, upload.single('file'), async (req, res) =>
 });
 
 // Apply AI-mapped column import
-router.post('/contacts-csv/apply', protect, upload.single('file'), async (req, res) => {
+router.post('/contacts-csv/apply', protect, upload.single('file'), enforceCsvRowCap(csvRowCounter), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 

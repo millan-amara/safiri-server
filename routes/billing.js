@@ -2,14 +2,38 @@ import { Router } from 'express';
 import Organization from '../models/Organization.js';
 import { protect } from '../middleware/auth.js';
 import * as paystack from '../services/paystack.js';
+import { PLANS } from '../config/plans.js';
 
 const router = Router();
 
-// Plan config — amounts in kobo (KES × 100)
-const PLAN_CONFIG = {
-  pro:      { amount: 499900,  aiLimit: 20,     whiteLabel: false },
-  business: { amount: 1299900, aiLimit: 999999, whiteLabel: true  },
-};
+// Plans the user can self-serve checkout for. Enterprise is sales-led.
+const SELF_SERVE_PLANS = ['starter', 'pro', 'business'];
+
+// ─── GET /api/billing/plans ───────────────────────────────────────────────────
+// Public catalog used by the pricing page. No auth — these are public prices.
+router.get('/plans', (req, res) => {
+  const catalog = Object.entries(PLANS).map(([key, p]) => ({
+    key,
+    label: p.label,
+    monthlyPriceKES: Math.round(p.amount / 100),
+    annualPriceKES: p.annualAmount ? Math.round(p.annualAmount / 100) : null,
+    aiCredits: p.aiCredits,
+    aiRateLimitPerMin: p.aiRateLimitPerMin,
+    seats: p.seats,
+    quotesPerMonth: p.quotesPerMonth,
+    partnerCaps: p.partnerCaps,
+    maxImagesPerRecord: p.maxImagesPerRecord,
+    pipelines: p.pipelines,
+    csvImportRows: p.csvImportRows,
+    pdfPresets: p.pdfPresets,
+    customPdfPresets: !!p.customPdfPresets,
+    whiteLabel: p.whiteLabel,
+    whatsapp: p.whatsapp,
+    webhooks: p.webhooks,
+    selfServe: SELF_SERVE_PLANS.includes(key),
+  }));
+  res.json({ plans: catalog });
+});
 
 // ─── GET /api/billing/status ──────────────────────────────────────────────────
 
@@ -21,7 +45,7 @@ const PLAN_CONFIG = {
 router.get('/status', protect, async (req, res) => {
   try {
     const org = await Organization.findById(req.organizationId)
-      .select('subscriptionStatus plan trialStartedAt trialEndsAt trialQuoteCount trialQuoteLimit currentPeriodEnd aiItineraryGenerationsUsed aiItineraryGenerationsLimit aiCreditsResetAt whiteLabel paystackSubscriptionCode')
+      .select('subscriptionStatus plan annual trialStartedAt trialEndsAt trialQuoteCount trialQuoteLimit currentPeriodEnd aiCreditsUsed aiCreditsLimit aiCreditsResetAt quotesThisMonth libraryImageCount whiteLabel paystackSubscriptionCode pendingPlan')
       .lean();
 
     if (!org) return res.status(404).json({ message: 'Organization not found' });
@@ -53,17 +77,16 @@ router.get('/status', protect, async (req, res) => {
  */
 router.post('/checkout', protect, async (req, res) => {
   try {
-    const { plan } = req.body;
-    if (!PLAN_CONFIG[plan]) {
-      return res.status(400).json({ message: 'Invalid plan. Must be "pro" or "business".' });
+    const { plan, annual = false } = req.body;
+    if (!SELF_SERVE_PLANS.includes(plan)) {
+      return res.status(400).json({ message: 'Invalid plan. Must be "starter", "pro", or "business".' });
     }
 
-    const planCode = plan === 'pro'
-      ? process.env.PAYSTACK_PLAN_PRO
-      : process.env.PAYSTACK_PLAN_BUSINESS;
-
+    const planConfig = PLANS[plan];
+    const codeEnv = annual ? planConfig.annualPlanCodeEnv : planConfig.planCodeEnv;
+    const planCode = process.env[codeEnv];
     if (!planCode) {
-      return res.status(500).json({ message: `Paystack plan code for "${plan}" is not configured. Set PAYSTACK_PLAN_${plan.toUpperCase()} in env.` });
+      return res.status(500).json({ message: `Paystack plan code missing. Set ${codeEnv} in env.` });
     }
 
     // Ensure the org has a Paystack customer record
@@ -80,7 +103,42 @@ router.post('/checkout', protect, async (req, res) => {
       }
     }
 
-    const { amount } = PLAN_CONFIG[plan];
+    const amount = annual ? planConfig.annualAmount : planConfig.amount;
+
+    // If the org already has an active paid subscription on a different plan, this is a plan change.
+    // For upgrades (higher-priced plan), cancel the existing subscription in Paystack so it doesn't
+    // double-charge, and credit any unused days from the current period onto the new subscription.
+    const orgFull = await Organization.findById(req.organizationId)
+      .select('plan subscriptionStatus currentPeriodEnd paystackSubscriptionCode pendingPlan')
+      .lean();
+
+    let creditDays = 0;
+    const isPlanChange = orgFull
+      && SELF_SERVE_PLANS.includes(orgFull.plan)
+      && orgFull.plan !== plan
+      && orgFull.subscriptionStatus === 'active';
+
+    const currentPrice = orgFull && PLANS[orgFull.plan]?.amount;
+    const isUpgrade = isPlanChange && currentPrice != null && amount > currentPrice;
+
+    if (isUpgrade) {
+      // Cancel the existing subscription in Paystack so the old plan doesn't renew.
+      if (orgFull.paystackSubscriptionCode) {
+        try {
+          const { data: sub } = await paystack.fetchSubscription(orgFull.paystackSubscriptionCode);
+          await paystack.disableSubscription(sub.subscription_code, sub.email_token);
+        } catch (e) {
+          console.warn('[billing] failed to cancel old subscription during upgrade:', e.message);
+          // Non-fatal — proceed with upgrade checkout
+        }
+      }
+
+      // Credit unused time: days remaining on the current period get added to the new period.
+      if (orgFull.currentPeriodEnd) {
+        const msRemaining = new Date(orgFull.currentPeriodEnd) - new Date();
+        creditDays = Math.max(0, Math.ceil(msRemaining / (1000 * 60 * 60 * 24)));
+      }
+    }
 
     const { data } = await paystack.initializeTransaction(
       req.user.email,
@@ -89,8 +147,10 @@ router.post('/checkout', protect, async (req, res) => {
       {
         organizationId: req.organizationId.toString(),
         plan,
+        annual,
         userId: req.user._id.toString(),
         customerCode,
+        creditDays,
       }
     );
 
@@ -125,24 +185,32 @@ router.get('/callback', async (req, res) => {
       return res.redirect(`${frontendBilling}?error=payment_failed`);
     }
 
-    const { organizationId, plan } = data.metadata || {};
-    if (!organizationId || !plan || !PLAN_CONFIG[plan]) {
+    const { organizationId, plan, annual } = data.metadata || {};
+    if (!organizationId || !plan || !SELF_SERVE_PLANS.includes(plan)) {
       return res.redirect(`${frontendBilling}?error=invalid_metadata`);
     }
 
-    // Calculate billing period end (1 month from payment date)
+    // Period end = 1 month (or 12 for annual) from payment date, plus any credited upgrade days.
     const paidAt = data.paid_at ? new Date(data.paid_at) : new Date();
     const periodEnd = new Date(paidAt);
-    periodEnd.setMonth(periodEnd.getMonth() + 1);
+    periodEnd.setMonth(periodEnd.getMonth() + (annual ? 12 : 1));
 
-    const { aiLimit, whiteLabel } = PLAN_CONFIG[plan];
+    const creditDays = Number(data.metadata?.creditDays) || 0;
+    if (creditDays > 0) {
+      periodEnd.setDate(periodEnd.getDate() + creditDays);
+    }
+
+    const planConfig = PLANS[plan];
 
     await Organization.findByIdAndUpdate(organizationId, {
       subscriptionStatus: 'active',
       plan,
+      annual: !!annual,
       currentPeriodEnd: periodEnd,
-      aiItineraryGenerationsLimit: aiLimit,
-      ...(whiteLabel && { whiteLabel: true }),
+      aiCreditsLimit: planConfig.aiCredits,
+      whiteLabel: planConfig.whiteLabel,
+      pendingPlan: null, // Any scheduled downgrade is superseded by this upgrade
+      ...(data.authorization?.authorization_code && { paystackAuthorizationCode: data.authorization.authorization_code }),
     });
 
     console.log(`[billing] org ${organizationId} upgraded to ${plan} (period ends ${periodEnd.toISOString()})`);
@@ -190,14 +258,22 @@ router.post('/webhook', async (req, res) => {
       }
 
       if (query) {
+        // Look up annual flag so recurring charges extend by the right interval.
+        const orgRow = await Organization.findOne(query).select('annual').lean();
         const paidAt = data.paid_at ? new Date(data.paid_at) : new Date();
         const periodEnd = new Date(paidAt);
-        periodEnd.setMonth(periodEnd.getMonth() + 1);
+        periodEnd.setMonth(periodEnd.getMonth() + (orgRow?.annual ? 12 : 1));
 
-        await Organization.findOneAndUpdate(query, {
+        const update = {
           subscriptionStatus: 'active',
           currentPeriodEnd: periodEnd,
-        });
+        };
+        // Save the authorization code so we can auto-charge at period end for scheduled downgrades
+        if (data.authorization?.authorization_code) {
+          update.paystackAuthorizationCode = data.authorization.authorization_code;
+        }
+
+        await Organization.findOneAndUpdate(query, update);
       }
 
     } else if (event === 'subscription.create') {
@@ -240,6 +316,87 @@ router.post('/webhook', async (req, res) => {
     console.error('[billing] webhook error:', err.message);
     // Still return 200 to prevent Paystack from retrying an unrecoverable error
     res.status(200).json({ received: true, error: err.message });
+  }
+});
+
+// ─── POST /api/billing/schedule-downgrade ────────────────────────────────────
+
+/**
+ * Schedule a downgrade to a lower-priced plan at the end of the current period.
+ * Cancels the Paystack subscription so it doesn't auto-renew at the higher price,
+ * then sets pendingPlan so the cron job can auto-charge for the new plan at period end.
+ *
+ * Currently only Business → Pro is supported.
+ */
+router.post('/schedule-downgrade', protect, async (req, res) => {
+  try {
+    const { plan: targetPlan } = req.body;
+    if (!['starter', 'pro'].includes(targetPlan)) {
+      return res.status(400).json({ message: 'Only downgrade to Starter or Pro is supported.' });
+    }
+
+    const org = await Organization.findById(req.organizationId)
+      .select('plan subscriptionStatus paystackSubscriptionCode currentPeriodEnd');
+
+    const currentRank = SELF_SERVE_PLANS.indexOf(org?.plan);
+    const targetRank = SELF_SERVE_PLANS.indexOf(targetPlan);
+    if (!org || org.subscriptionStatus !== 'active' || currentRank < 0 || targetRank >= currentRank) {
+      return res.status(400).json({ message: 'No active higher-tier subscription to downgrade from.' });
+    }
+
+    // Cancel the Paystack subscription so it doesn't auto-renew at the Business price
+    if (org.paystackSubscriptionCode) {
+      try {
+        const { data: sub } = await paystack.fetchSubscription(org.paystackSubscriptionCode);
+        await paystack.disableSubscription(sub.subscription_code, sub.email_token);
+      } catch (e) {
+        console.warn('[billing] failed to cancel Paystack subscription during downgrade schedule:', e.message);
+      }
+    }
+
+    org.pendingPlan = targetPlan;
+    await org.save();
+
+    const effectiveDate = org.currentPeriodEnd
+      ? new Date(org.currentPeriodEnd).toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' })
+      : 'the end of your current period';
+
+    res.json({
+      message: `Downgrade to ${PLANS[targetPlan].label} scheduled. You'll stay on ${PLANS[org.plan].label} until ${effectiveDate}, then move automatically.`,
+      pendingPlan: targetPlan,
+      effectiveAt: org.currentPeriodEnd,
+    });
+  } catch (err) {
+    console.error('[billing] schedule-downgrade error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── POST /api/billing/cancel-downgrade ──────────────────────────────────────
+
+/**
+ * Clear a scheduled downgrade. The user keeps their current plan until period end,
+ * but since the Paystack subscription was cancelled when the downgrade was scheduled,
+ * they'll need to re-subscribe to keep auto-renewal active. Returns a flag so the UI
+ * can prompt them to re-checkout.
+ */
+router.post('/cancel-downgrade', protect, async (req, res) => {
+  try {
+    const org = await Organization.findById(req.organizationId).select('pendingPlan plan');
+    if (!org || !org.pendingPlan) {
+      return res.status(400).json({ message: 'No scheduled downgrade to cancel.' });
+    }
+
+    org.pendingPlan = null;
+    await org.save();
+
+    res.json({
+      message: `Scheduled downgrade cancelled. To keep auto-renewing on ${org.plan}, please resubscribe.`,
+      resubscribeRequired: true,
+    });
+  } catch (err) {
+    console.error('[billing] cancel-downgrade error:', err.message);
+    res.status(500).json({ message: err.message });
   }
 });
 

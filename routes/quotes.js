@@ -3,7 +3,7 @@ import Quote from '../models/Quote.js';
 import Organization from '../models/Organization.js';
 import Hotel from '../models/Hotel.js';
 import { protect } from '../middleware/auth.js';
-import { requireTrialQuoteQuota, trackTrialQuoteUsage } from '../middleware/subscription.js';
+import { requireQuoteQuota, trackQuoteUsage } from '../middleware/subscription.js';
 import { createNotification } from './notifications.js';
 
 const router = Router();
@@ -81,7 +81,7 @@ function sanitizeDays(days) {
 }
 
 // Create quote
-router.post('/', protect, requireTrialQuoteQuota, async (req, res) => {
+router.post('/', protect, requireQuoteQuota, async (req, res) => {
   try {
     // Snapshot branding at creation time (need full doc for branding fields)
     const org = await Organization.findById(req.organizationId);
@@ -119,7 +119,7 @@ router.post('/', protect, requireTrialQuoteQuota, async (req, res) => {
     });
 
     // Increment trial quote counter (no-op if not on trial)
-    await trackTrialQuoteUsage(req.organizationId, req.organization?.plan);
+    await trackQuoteUsage(req.organizationId, req.organization?.plan);
 
     res.status(201).json(quote);
   } catch (error) {
@@ -249,7 +249,7 @@ router.post('/:id/save-as-template', protect, async (req, res) => {
 });
 
 // Duplicate template into a new quote
-router.post('/templates/:id/use', protect, requireTrialQuoteQuota, async (req, res) => {
+router.post('/templates/:id/use', protect, requireQuoteQuota, async (req, res) => {
   try {
     const template = await Quote.findOne({ _id: req.params.id, organization: req.organizationId, isTemplate: true });
     if (!template) return res.status(404).json({ message: 'Template not found' });
@@ -278,7 +278,7 @@ router.post('/templates/:id/use', protect, requireTrialQuoteQuota, async (req, r
       createdBy: req.user._id,
     });
 
-    await trackTrialQuoteUsage(req.organizationId, req.organization?.plan);
+    await trackQuoteUsage(req.organizationId, req.organization?.plan);
 
     res.status(201).json(newQuote);
   } catch (error) {

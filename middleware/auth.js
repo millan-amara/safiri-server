@@ -31,7 +31,7 @@ export const protect = async (req, res, next) => {
     // Load and cache the org on every authenticated request.
     // Subscription middleware reads req.organization directly — no extra DB round-trip.
     const org = await Organization.findById(user.organization)
-      .select('subscriptionStatus plan trialStartedAt trialEndsAt trialQuoteCount trialQuoteLimit aiItineraryGenerationsUsed aiItineraryGenerationsLimit aiCreditsResetAt currentPeriodEnd whiteLabel paystackSubscriptionCode')
+      .select('subscriptionStatus plan annual trialStartedAt trialEndsAt trialQuoteCount trialQuoteLimit aiCreditsUsed aiCreditsLimit aiCreditsResetAt quotesThisMonth quotesMonthResetAt libraryImageCount currentPeriodEnd whiteLabel paystackSubscriptionCode')
       .lean();
     req.organization = org;
 
@@ -73,6 +73,24 @@ export const authorize = (...roles) => {
     }
     next();
   };
+};
+
+// Superadmin check — email whitelist from env (comma-separated SUPERADMIN_EMAILS).
+export const isSuperAdminEmail = (email) => {
+  if (!email) return false;
+  const list = (process.env.SUPERADMIN_EMAILS || '')
+    .split(',')
+    .map(e => e.trim().toLowerCase())
+    .filter(Boolean);
+  return list.includes(email.toLowerCase());
+};
+
+// Apply AFTER `protect` so req.user is populated.
+export const requireSuperAdmin = (req, res, next) => {
+  if (!isSuperAdminEmail(req.user?.email)) {
+    return res.status(403).json({ message: 'Superadmin access required' });
+  }
+  next();
 };
 
 // Generate JWT

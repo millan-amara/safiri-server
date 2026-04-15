@@ -44,9 +44,11 @@ const organizationSchema = new mongoose.Schema({
   },
   plan: {
     type: String,
-    enum: ['trial', 'pro', 'business', 'enterprise'],
+    enum: ['trial', 'starter', 'pro', 'business', 'enterprise'],
     default: 'trial',
   },
+  // Annual billing flag — toggled by the chosen Paystack plan code at checkout.
+  annual: { type: Boolean, default: false },
 
   // Trial window
   trialStartedAt: { type: Date, default: Date.now },
@@ -60,13 +62,26 @@ const organizationSchema = new mongoose.Schema({
   // Paystack identifiers
   paystackCustomerCode: { type: String },
   paystackSubscriptionCode: { type: String },
+  paystackAuthorizationCode: { type: String }, // Saved card token — used to auto-charge at period end for scheduled downgrades
 
-  // AI usage (resets monthly)
-  aiItineraryGenerationsUsed: { type: Number, default: 0 },
-  aiItineraryGenerationsLimit: { type: Number, default: 20 }, // 20 for trial/pro, unlimited (999999) for business
+  // Scheduled plan change — set to a lower-tier plan when user downgrades; cron applies it at currentPeriodEnd.
+  pendingPlan: {
+    type: String,
+    enum: ['starter', 'pro', 'business', null],
+    default: null,
+  },
+
+  // ─── AI credit ledger (resets calendar-monthly) ───────────────────────────
+  // Credits consumed at varying cost: heavy=10, medium=3, light=1 (see config/plans.js).
+  aiCreditsUsed: { type: Number, default: 0 },
+  aiCreditsLimit: { type: Number, default: 20 }, // seeded from PLANS[plan].aiCredits
   aiCreditsResetAt: { type: Date },      // 1st of next month — set on org creation & each reset
 
-  // Business plan feature
+  // ─── Quote monthly counter (only enforced on tiers with a quotesPerMonth cap) ──
+  quotesThisMonth: { type: Number, default: 0 },
+  quotesMonthResetAt: { type: Date },
+
+  // Feature flag — derived from plan but stored for fast lookups on hot paths (PDF render, quote share).
   whiteLabel: { type: Boolean, default: false }, // hides "Powered by SafiriPro" on quote share pages
   
   // n8n automation endpoint

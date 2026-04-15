@@ -22,7 +22,7 @@ const aiUsageLogSchema = new mongoose.Schema({
     // One of: draft-itinerary, generate-all-narratives, generate-narrative,
     //         deal-summary, draft-email, suggest-route, map-columns
   },
-  timestamp: { type: Date, default: Date.now, index: true },
+  timestamp: { type: Date, default: Date.now },
   estimatedCostUsd: { type: Number, required: true },
   success: { type: Boolean, required: true },
   errorMessage: { type: String, default: null },
