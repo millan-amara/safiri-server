@@ -1107,10 +1107,9 @@ router.get('/:id/pdf/download', protect, async (req, res) => {
     let browser;
     try {
       browser = await getBrowser();
-    } catch {
-      return res.setHeader('Content-Type', 'text/html').send(
-        html.replace('</head>', `<script>window.onload=()=>window.print();</script></head>`)
-      );
+    } catch (err) {
+      console.error('[pdf/download] puppeteer launch failed:', err);
+      return res.status(500).json({ message: 'Failed to generate PDF', error: err.message });
     }
 
     const page = await browser.newPage();
