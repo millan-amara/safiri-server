@@ -66,6 +66,7 @@ router.get('/contacts/:id', protect, async (req, res) => {
 router.post('/contacts', protect, requireTrialContactQuota, async (req, res) => {
   try {
     const contact = await Contact.create({ ...req.body, organization: req.organizationId });
+    triggerAutomation('contact.created', { organizationId: req.organizationId, contact, userId: req.user._id });
     res.status(201).json(contact);
   } catch (error) {
     res.status(500).json({ message: error.message });

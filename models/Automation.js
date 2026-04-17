@@ -16,6 +16,7 @@ export const ACTION_TYPES = [
   'send_email',
   'send_notification',
   'send_webhook',
+  'send_whatsapp',
   'create_task',
   'create_deal',
   'assign_to_user',
@@ -44,6 +45,10 @@ const actionSchema = new mongoose.Schema({
     url: String,
     method: { type: String, enum: ['POST', 'GET'], default: 'POST' },
     payload: mongoose.Schema.Types.Mixed,
+
+    // send_whatsapp
+    whatsappTo: String,        // 'contact' | 'assigned_user'
+    whatsappMessage: String,   // supports {{contact.firstName}}, {{deal.title}} etc.
 
     // create_task
     taskTitle: String,

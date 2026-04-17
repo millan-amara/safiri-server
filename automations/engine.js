@@ -106,6 +106,38 @@ async function executeAction(action, context, organizationId) {
         return { success: true, action: 'send_webhook' };
       }
 
+      case 'send_whatsapp': {
+        let phone;
+        if (config.whatsappTo === 'assigned_user') {
+          const uid = context.deal?.assignedTo?._id || context.deal?.assignedTo || context.contact?.assignedTo?._id || context.contact?.assignedTo;
+          if (uid) {
+            const user = await User.findById(uid).select('phone name').lean();
+            phone = user?.phone;
+          }
+        } else {
+          phone = context.contact?.phone;
+        }
+
+        const message = interpolate(config.whatsappMessage, context);
+        if (!phone) return { success: false, error: 'No recipient phone number' };
+
+        console.log(`[WhatsApp automation] to ${phone}: ${message}`);
+
+        const notifyUserId = context.deal?.assignedTo?._id || context.deal?.assignedTo || context.contact?.assignedTo?._id || context.contact?.assignedTo || context.userId;
+        if (notifyUserId) {
+          await createNotification({
+            organization: organizationId,
+            user: notifyUserId,
+            type: 'system',
+            title: `WhatsApp sent to ${phone}`,
+            message,
+            entityType: context.deal ? 'deal' : context.contact ? 'contact' : null,
+            entityId: context.deal?._id || context.contact?._id || null,
+          });
+        }
+        return { success: true, action: 'send_whatsapp', to: phone };
+      }
+
       case 'create_task': {
         const assignTo = resolveAssignee(config.assignTo, context);
         const dueDate = new Date();
