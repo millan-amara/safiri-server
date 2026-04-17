@@ -6,6 +6,7 @@ export const TRIGGER_TYPES = [
   'deal.won',
   'deal.lost',
   'contact.created',
+  'task.assigned',
   'task.overdue',
   'deal.inactive',
   'quote.viewed',
@@ -80,8 +81,9 @@ const automationSchema = new mongoose.Schema({
   trigger: {
     type: { type: String, enum: TRIGGER_TYPES, required: true },
     config: {
-      inactiveDays: Number,          // for deal.inactive
-      toStage: String,               // for deal.stage_changed — only fire for this stage
+      inactiveDays: Number,                              // for deal.inactive
+      toStage: String,                                   // for deal.stage_changed — only fire for this stage
+      pipelineId: mongoose.Schema.Types.ObjectId,        // for deal.stage_changed — only fire in this pipeline
     },
   },
 

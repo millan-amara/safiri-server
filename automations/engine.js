@@ -74,9 +74,15 @@ async function executeAction(action, context, organizationId) {
 
       case 'send_notification': {
         let targetUserId;
-        if (config.targetUser === 'assigned_user') targetUserId = context.deal?.assignedTo?._id || context.deal?.assignedTo;
-        else if (config.targetUser === 'creator') targetUserId = context.deal?.createdBy?._id || context.deal?.createdBy;
-        else targetUserId = config.targetUser;
+        if (config.targetUser === 'assigned_user') {
+          targetUserId = context.deal?.assignedTo?._id || context.deal?.assignedTo
+            || context.contact?.assignedTo?._id || context.contact?.assignedTo
+            || context.task?.assignedTo?._id || context.task?.assignedTo;
+        } else if (config.targetUser === 'creator') {
+          targetUserId = context.deal?.createdBy?._id || context.deal?.createdBy || context.userId;
+        } else {
+          targetUserId = config.targetUser;
+        }
 
         if (targetUserId) {
           await createNotification({
@@ -167,9 +173,12 @@ async function executeAction(action, context, organizationId) {
         }
         if (!pipeline) return { success: false, error: 'No pipeline found' };
 
-        const stage = config.stageId
-          ? pipeline.stages.find(s => s._id.toString() === config.stageId || s.name === config.stageId)
-          : pipeline.stages.sort((a, b) => a.order - b.order)[0];
+        const sortedStages = pipeline.stages.slice().sort((a, b) => a.order - b.order);
+        const firstStage = sortedStages[0];
+        const stage = (config.stageId
+          ? pipeline.stages.find(s => String(s._id) === String(config.stageId) || s.name === config.stageId)
+          : firstStage) || firstStage;
+        if (!stage) return { success: false, error: 'Pipeline has no stages' };
 
         const assignTo = resolveAssignee(config.assignDealTo, context);
 
@@ -178,7 +187,7 @@ async function executeAction(action, context, organizationId) {
           title: interpolate(config.dealTitle || 'New deal: {{contact.firstName}} {{contact.lastName}}', context),
           contact: context.contact._id,
           pipeline: pipeline._id,
-          stage: stage?.name || 'New Inquiry',
+          stage: stage.name,
           assignedTo: assignTo || null,
           createdBy: context.userId || null,
           activities: [{ type: 'deal_created', description: 'Auto-created by automation', createdAt: new Date() }],
@@ -188,8 +197,18 @@ async function executeAction(action, context, organizationId) {
 
       case 'assign_to_user': {
         if (!config.userId) return { success: false, error: 'No userId' };
-        if (context.deal?._id) await Deal.findByIdAndUpdate(context.deal._id, { assignedTo: config.userId });
-        if (context.contact?._id) await Contact.findByIdAndUpdate(context.contact._id, { assignedTo: config.userId });
+        const trigger = context.triggerType || '';
+        if (trigger.startsWith('deal.') && context.deal?._id) {
+          await Deal.findByIdAndUpdate(context.deal._id, { assignedTo: config.userId });
+        } else if (trigger.startsWith('task.') && context.task?._id) {
+          await Task.findByIdAndUpdate(context.task._id, { assignedTo: config.userId });
+        } else if (trigger.startsWith('contact.') && context.contact?._id) {
+          await Contact.findByIdAndUpdate(context.contact._id, { assignedTo: config.userId });
+        } else if (context.deal?._id) {
+          await Deal.findByIdAndUpdate(context.deal._id, { assignedTo: config.userId });
+        } else if (context.contact?._id) {
+          await Contact.findByIdAndUpdate(context.contact._id, { assignedTo: config.userId });
+        }
         return { success: true, action: 'assign_to_user' };
       }
 
@@ -260,9 +279,13 @@ export async function triggerAutomation(triggerType, eventData) {
 
     for (const automation of automations) {
       try {
-        // Stage filter check
-        if (triggerType === 'deal.stage_changed' && automation.trigger.config?.toStage) {
-          if (toStage !== automation.trigger.config.toStage) continue;
+        // Stage + pipeline filter check
+        if (triggerType === 'deal.stage_changed') {
+          if (automation.trigger.config?.toStage && toStage !== automation.trigger.config.toStage) continue;
+          if (automation.trigger.config?.pipelineId) {
+            const dealPipelineId = populatedDeal?.pipeline?._id || populatedDeal?.pipeline;
+            if (String(dealPipelineId) !== String(automation.trigger.config.pipelineId)) continue;
+          }
         }
 
         // Conditions check

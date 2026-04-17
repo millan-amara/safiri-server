@@ -221,15 +221,7 @@ router.post('/deals', protect, async (req, res) => {
       .populate('pipeline', 'name stages');
 
     // Fire automation
-    triggerAutomation(req.organizationId, 'deal_created', {
-      eventType: 'deal_created',
-      dealId: deal._id,
-      dealTitle: deal.title,
-      entityType: 'deal',
-      entityId: deal._id,
-      createdBy: req.user._id,
-      assignedTo: deal.assignedTo,
-    });
+    triggerAutomation('deal.created', { organizationId: req.organizationId, deal, userId: req.user._id });
 
     // WhatsApp — notify assignee if they have a phone
     if (deal.assignedTo) {
@@ -270,17 +262,18 @@ router.put('/deals/:id', protect, async (req, res) => {
         req.body.lostAt = new Date();
       }
 
-      triggerAutomation(req.organizationId, 'deal_stage_changed', {
-        eventType: 'deal_stage_changed',
-        dealId: existing._id,
-        dealTitle: existing.title,
-        stage: req.body.stage,
-        previousStage: existing.stage,
-        entityType: 'deal',
-        entityId: existing._id,
-        createdBy: req.user._id,
-        assignedTo: existing.assignedTo || req.user._id,
+      triggerAutomation('deal.stage_changed', {
+        organizationId: req.organizationId,
+        deal: existing,
+        userId: req.user._id,
+        toStage: req.body.stage,
       });
+
+      if (req.body.stage === 'Won') {
+        triggerAutomation('deal.won', { organizationId: req.organizationId, deal: existing, userId: req.user._id });
+      } else if (req.body.stage === 'Lost') {
+        triggerAutomation('deal.lost', { organizationId: req.organizationId, deal: existing, userId: req.user._id });
+      }
     }
 
     // Track assignment changes
@@ -434,15 +427,7 @@ router.post('/tasks', protect, async (req, res) => {
 
     // Fire automation if assigned
     if (task.assignedTo) {
-      triggerAutomation(req.organizationId, 'task_assigned', {
-        eventType: 'task_assigned',
-        taskTitle: task.title,
-        entityType: 'task',
-        entityId: task._id,
-        assignedTo: task.assignedTo,
-        createdBy: req.user._id,
-        dealId: task.deal,
-      });
+      triggerAutomation('task.assigned', { organizationId: req.organizationId, task, userId: req.user._id });
 
       // WhatsApp — notify assignee if they have a phone
       User.findById(task.assignedTo).select('name phone').lean()
@@ -472,12 +457,19 @@ router.post('/tasks', protect, async (req, res) => {
 router.put('/tasks/:id', protect, async (req, res) => {
   try {
     if (req.body.status === 'done') req.body.completedAt = new Date();
+    const prior = await Task.findOne({ _id: req.params.id, organization: req.organizationId }).select('assignedTo').lean();
     const task = await Task.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
       req.body,
       { new: true }
     ).populate('assignedTo', 'name avatar');
     if (!task) return res.status(404).json({ message: 'Not found' });
+
+    const newAssignee = task.assignedTo?._id || task.assignedTo;
+    const priorAssignee = prior?.assignedTo;
+    if (newAssignee && String(newAssignee) !== String(priorAssignee || '')) {
+      triggerAutomation('task.assigned', { organizationId: req.organizationId, task, userId: req.user._id });
+    }
 
     // Cancel existing job then reschedule if task is still active and has a due date
     const isFinished = ['done', 'cancelled'].includes(task.status);

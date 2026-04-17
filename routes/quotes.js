@@ -5,6 +5,7 @@ import Hotel from '../models/Hotel.js';
 import { protect } from '../middleware/auth.js';
 import { requireQuoteQuota, trackQuoteUsage } from '../middleware/subscription.js';
 import { createNotification } from './notifications.js';
+import { triggerAutomation } from '../automations/engine.js';
 
 const router = Router();
 
@@ -142,12 +143,23 @@ router.put('/:id', protect, async (req, res) => {
     if (body.contact === '' || body.contact === null) body.contact = undefined;
     if (body.deal === '' || body.deal === null) body.deal = undefined;
 
+    const prior = await Quote.findOne({ _id: req.params.id, organization: req.organizationId }).select('status deal contact').lean();
     const quote = await Quote.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
       body,
       { new: true }
     );
     if (!quote) return res.status(404).json({ message: 'Not found' });
+
+    if (prior && prior.status !== 'sent' && quote.status === 'sent') {
+      triggerAutomation('quote.sent', {
+        organizationId: req.organizationId,
+        deal: quote.deal ? { _id: quote.deal } : null,
+        contact: quote.contact ? { _id: quote.contact } : null,
+        userId: req.user._id,
+      });
+    }
+
     res.json(quote);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -332,6 +344,12 @@ router.get('/share/:token', async (req, res) => {
           entityId: quote._id,
         });
       }
+      triggerAutomation('quote.viewed', {
+        organizationId: quote.organization,
+        deal: quote.deal ? { _id: quote.deal } : null,
+        contact: quote.contact ? { _id: quote.contact._id || quote.contact } : null,
+        userId: quote.createdBy?._id || quote.createdBy,
+      });
     }
 
     await quote.save();
