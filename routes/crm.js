@@ -6,7 +6,6 @@ import User from '../models/User.js';
 import Organization from '../models/Organization.js';
 import { protect } from '../middleware/auth.js';
 import { triggerAutomation } from '../automations/engine.js';
-import { scheduleTaskReminder, cancelTaskReminder } from '../queues/reminderQueue.js';
 import { notify } from '../utils/notify.js';
 import { requirePipelineQuota, requireTrialContactQuota } from '../middleware/partnerQuota.js';
 
@@ -440,13 +439,7 @@ router.post('/tasks', protect, async (req, res) => {
         .catch(err => console.error('[notify] task_assigned failed:', err.message));
     }
 
-    // Schedule WhatsApp reminder
-    if (task.dueDate) {
-      const orgDefault = await Organization.findById(req.organizationId).select('defaults.taskReminderHours').lean();
-      const reminderHours = task.reminderHours ?? orgDefault?.defaults?.taskReminderHours ?? 24;
-      scheduleTaskReminder(task._id, task.dueDate, reminderHours)
-        .catch(err => console.error('[ReminderQueue] schedule failed:', err.message));
-    }
+    // Task reminder fires automatically via the poller — reminderSentAt defaults to null.
 
     res.status(201).json(populated);
   } catch (error) {
@@ -457,7 +450,17 @@ router.post('/tasks', protect, async (req, res) => {
 router.put('/tasks/:id', protect, async (req, res) => {
   try {
     if (req.body.status === 'done') req.body.completedAt = new Date();
-    const prior = await Task.findOne({ _id: req.params.id, organization: req.organizationId }).select('assignedTo').lean();
+    const prior = await Task.findOne({ _id: req.params.id, organization: req.organizationId })
+      .select('assignedTo dueDate reminderHours').lean();
+
+    const dueDateChanged = 'dueDate' in req.body &&
+      new Date(req.body.dueDate || 0).getTime() !== new Date(prior?.dueDate || 0).getTime();
+    const reminderHoursChanged = 'reminderHours' in req.body &&
+      req.body.reminderHours !== prior?.reminderHours;
+    if (dueDateChanged || reminderHoursChanged) {
+      req.body.reminderSentAt = null;
+    }
+
     const task = await Task.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
       req.body,
@@ -471,20 +474,6 @@ router.put('/tasks/:id', protect, async (req, res) => {
       triggerAutomation('task.assigned', { organizationId: req.organizationId, task, userId: req.user._id });
     }
 
-    // Cancel existing job then reschedule if task is still active and has a due date
-    const isFinished = ['done', 'cancelled'].includes(task.status);
-    if (isFinished) {
-      cancelTaskReminder(task._id)
-        .catch(err => console.error('[ReminderQueue] cancel failed:', err.message));
-    } else if (task.dueDate) {
-      Organization.findById(req.organizationId).select('defaults.taskReminderHours').lean()
-        .then(org => {
-          const reminderHours = task.reminderHours ?? org?.defaults?.taskReminderHours ?? 24;
-          return scheduleTaskReminder(task._id, task.dueDate, reminderHours);
-        })
-        .catch(err => console.error('[ReminderQueue] reschedule failed:', err.message));
-    }
-
     res.json(task);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -494,8 +483,6 @@ router.put('/tasks/:id', protect, async (req, res) => {
 router.delete('/tasks/:id', protect, async (req, res) => {
   try {
     await Task.findOneAndDelete({ _id: req.params.id, organization: req.organizationId });
-    cancelTaskReminder(req.params.id)
-      .catch(err => console.error('[ReminderQueue] cancel on delete failed:', err.message));
     res.json({ message: 'Deleted' });
   } catch (error) {
     res.status(500).json({ message: error.message });

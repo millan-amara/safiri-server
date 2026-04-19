@@ -19,9 +19,11 @@ const taskSchema = new mongoose.Schema({
   
   completedAt: Date,
   reminderHours: { type: Number, default: null }, // null = use org default, 0 = no reminder
+  reminderSentAt: { type: Date, default: null }, // set by reminder poller when fired — reset on dueDate/reminderHours change
   overdueNotifiedAt: { type: Date, default: null }, // set when overdue WhatsApp is sent — prevents repeat firing
 }, { timestamps: true });
 
 taskSchema.index({ organization: 1, assignedTo: 1, status: 1 });
+taskSchema.index({ reminderSentAt: 1, status: 1, dueDate: 1 });
 
 export default mongoose.model('Task', taskSchema);

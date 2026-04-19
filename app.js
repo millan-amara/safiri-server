@@ -21,7 +21,7 @@ import cronRoutes from './routes/cron.js';
 import billingRoutes from './routes/billing.js';
 import libraryRoutes from './routes/library.js';
 import { checkInactiveDeals, checkOverdueTasks } from './automations/engine.js';
-import { startReminderWorker } from './queues/reminderQueue.js';
+import { startReminderPoller } from './queues/reminderPoller.js';
 
 dotenv.config();
 
@@ -133,8 +133,8 @@ const start = async () => {
     setInterval(checkInactiveDeals, 6 * 60 * 60 * 1000);  // every 6 hours
     setInterval(checkOverdueTasks, 60 * 60 * 1000);        // every hour
 
-    // BullMQ worker — processes per-task reminder jobs from Redis
-    startReminderWorker();
+    // Task reminder poller — MongoDB-backed, 60s interval
+    startReminderPoller();
   });
 };
 
