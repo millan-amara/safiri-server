@@ -24,6 +24,7 @@ const BUCKETS = [
   // ── Kenya safari parks ──────────────────────────────────────────────
   { name: 'Maasai Mara',    query: 'maasai mara safari',        tags: ['maasai mara', 'masai mara', 'mara', 'kenya'],  destinationType: 'safari',   count: 12 },
   { name: 'Maasai Mara landscape', query: 'maasai mara landscape', tags: ['maasai mara', 'landscape', 'kenya'],         destinationType: 'safari',   count: 6 },
+  { name: 'Mara',           query: 'mara',                      tags: ['maasai mara', 'masai mara', 'mara', 'kenya'],  destinationType: 'safari',   count: 10 },
   { name: 'Amboseli',       query: 'amboseli kilimanjaro',      tags: ['amboseli', 'kenya'],                           destinationType: 'safari',   count: 10 },
   { name: 'Tsavo',          query: 'tsavo elephants kenya',     tags: ['tsavo', 'kenya'],                              destinationType: 'safari',   count: 8 },
   { name: 'Samburu',        query: 'samburu national reserve',  tags: ['samburu', 'kenya'],                            destinationType: 'safari',   count: 8 },

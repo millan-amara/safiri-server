@@ -34,6 +34,17 @@ const parseTags = (raw) => {
   return String(raw).split(',').map(t => t.trim()).filter(Boolean);
 };
 
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Build OR conditions that match each term as a case-insensitive substring
+// against either a tag (array element) or the caption. Makes "elephant" find
+// images tagged "elephants" or captioned "elephant herd".
+const buildTermConditions = (terms) =>
+  terms.flatMap(t => {
+    const rx = new RegExp(escapeRegex(t), 'i');
+    return [{ tags: rx }, { caption: rx }];
+  });
+
 // ─── PUBLIC (auth'd): search Pexels stock photos ─
 // Server-side proxy keeps the API key off the client. Pexels License allows
 // commercial use with attribution recommended — we surface photographer credit
@@ -82,13 +93,14 @@ router.get('/search', protect, async (req, res) => {
     const { q = '', type, limit = 40 } = req.query;
     const filter = { isActive: true };
 
-    const tags = parseTags(q).map(t => t.toLowerCase());
-    // Tag matches are most specific; destinationType widens the net so a "beach"
-    // day still surfaces generic beach shots when no image is tagged with the location name.
-    if (tags.length && type) {
-      filter.$or = [{ tags: { $in: tags } }, { destinationType: type }];
-    } else if (tags.length) {
-      filter.tags = { $in: tags };
+    const terms = parseTags(q).map(t => t.toLowerCase());
+    const termConds = buildTermConditions(terms);
+    // Term matches (tag/caption substring) are specific; destinationType widens the net
+    // so a "beach" day still surfaces generic beach shots when no image matches the term.
+    if (terms.length && type) {
+      filter.$or = [...termConds, { destinationType: type }];
+    } else if (terms.length) {
+      filter.$or = termConds;
     } else if (type) {
       filter.destinationType = type;
     }
@@ -120,10 +132,18 @@ router.get('/admin', protect, requireSuperAdmin, async (req, res) => {
   try {
     const { q, type, limit = 200 } = req.query;
     const filter = {};
-    if (type) filter.destinationType = type;
     if (q) {
-      const tags = parseTags(q).map(t => t.toLowerCase());
-      if (tags.length) filter.tags = { $in: tags };
+      const terms = parseTags(q).map(t => t.toLowerCase());
+      const termConds = buildTermConditions(terms);
+      if (terms.length && type) {
+        filter.$and = [{ $or: termConds }, { destinationType: type }];
+      } else if (terms.length) {
+        filter.$or = termConds;
+      } else if (type) {
+        filter.destinationType = type;
+      }
+    } else if (type) {
+      filter.destinationType = type;
     }
     const items = await LibraryImage.find(filter).sort({ createdAt: -1 }).limit(Number(limit));
     res.json(items);
