@@ -34,6 +34,47 @@ const parseTags = (raw) => {
   return String(raw).split(',').map(t => t.trim()).filter(Boolean);
 };
 
+// ─── PUBLIC (auth'd): search Pexels stock photos ─
+// Server-side proxy keeps the API key off the client. Pexels License allows
+// commercial use with attribution recommended — we surface photographer credit
+// back to the UI via the standard {credit, creditUrl} shape.
+router.get('/stock/search', protect, async (req, res) => {
+  try {
+    const apiKey = process.env.PEXELS_API_KEY;
+    if (!apiKey) return res.status(503).json({ message: 'Stock photo search is not configured' });
+
+    const q = String(req.query.q || '').trim();
+    if (!q) return res.json({ page: 1, perPage: 0, total: 0, items: [] });
+
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const perPage = Math.min(80, Math.max(1, Number(req.query.perPage) || 24));
+
+    const url = `https://api.pexels.com/v1/search?query=${encodeURIComponent(q)}&per_page=${perPage}&page=${page}`;
+    const response = await fetch(url, { headers: { Authorization: apiKey } });
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      return res.status(response.status).json({ message: `Pexels API error: ${response.status}`, detail: text.slice(0, 200) });
+    }
+    const data = await response.json();
+
+    const items = (data.photos || []).map(p => ({
+      id: p.id,
+      url: p.src?.large || p.src?.large2x || p.src?.original,
+      thumbnail: p.src?.medium || p.src?.small || p.src?.tiny,
+      credit: p.photographer,
+      creditUrl: p.photographer_url,
+      caption: p.alt || '',
+      source: 'pexels',
+      width: p.width,
+      height: p.height,
+    }));
+
+    res.json({ page: data.page, perPage: data.per_page, total: data.total_results, items });
+  } catch (e) {
+    res.status(500).json({ message: e.message });
+  }
+});
+
 // ─── PUBLIC (auth'd): search active library ──────
 // Any logged-in user can query. No org scoping — library is global.
 router.get('/search', protect, async (req, res) => {
