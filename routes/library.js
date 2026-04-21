@@ -42,8 +42,15 @@ router.get('/search', protect, async (req, res) => {
     const filter = { isActive: true };
 
     const tags = parseTags(q).map(t => t.toLowerCase());
-    if (tags.length) filter.tags = { $in: tags };
-    if (type) filter.destinationType = type;
+    // Tag matches are most specific; destinationType widens the net so a "beach"
+    // day still surfaces generic beach shots when no image is tagged with the location name.
+    if (tags.length && type) {
+      filter.$or = [{ tags: { $in: tags } }, { destinationType: type }];
+    } else if (tags.length) {
+      filter.tags = { $in: tags };
+    } else if (type) {
+      filter.destinationType = type;
+    }
 
     const items = await LibraryImage.find(filter)
       .select('url caption credit attribution sourceUrl tags destinationType')
