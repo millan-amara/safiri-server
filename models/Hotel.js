@@ -85,6 +85,9 @@ const addOnSchema = new mongoose.Schema({
     default: 'per_person_per_day',
   },
   amount: { type: Number, default: 0 },
+  // Add-ons can be priced in a different currency than the rate list
+  // (Chui: KES rooms, USD lunch/vehicle add-ons). Blank = inherit from list.
+  currency: { type: String, default: '' },
   optional: { type: Boolean, default: true },        // false = mandatory add-on (rare)
 }, { _id: false });
 

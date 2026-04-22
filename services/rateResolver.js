@@ -432,16 +432,20 @@ export function priceStay({
     amountInQuoteCurrency: convert(f.amount, f.currency || rateList.currency, quoteCurrency, orgFxOverrides),
   }));
 
-  // Add-ons — listed, not auto-added
-  const addOns = (rateList.addOns || []).map(a => ({
-    name: a.name,
-    description: a.description || '',
-    unit: a.unit,
-    amount: a.amount,
-    optional: a.optional !== false,
-    currency: rateList.currency,
-    amountInQuoteCurrency: convert(a.amount, rateList.currency, quoteCurrency, orgFxOverrides),
-  }));
+  // Add-ons — listed, not auto-added. Each can carry its own currency (e.g.
+  // Chui's KES rate list with USD-denominated lunch / vehicle add-ons).
+  const addOns = (rateList.addOns || []).map(a => {
+    const currency = a.currency || rateList.currency;
+    return {
+      name: a.name,
+      description: a.description || '',
+      unit: a.unit,
+      amount: a.amount,
+      optional: a.optional !== false,
+      currency,
+      amountInQuoteCurrency: convert(a.amount, currency, quoteCurrency, orgFxOverrides),
+    };
+  });
 
   return {
     ok: true,

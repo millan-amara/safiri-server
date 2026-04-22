@@ -211,7 +211,7 @@ You MUST respond with ONLY valid JSON — no markdown, no commentary. The schema
         }
       ],
       "addOns": [
-        { "name": "Drinks Package", "unit": "per_person_per_day", "amount": number, "optional": true }
+        { "name": "Drinks Package", "unit": "per_person_per_day", "amount": number, "currency": "USD" | "KES" | ... (omit to inherit rate list currency), "optional": true }
       ],
       "passThroughFees": [
         { "name": "Mara Reserve Fee", "unit": "per_person_per_day", "currency": "USD",
@@ -238,8 +238,9 @@ Rules:
 - PUBLIC HOLIDAYS: if the weekend column explicitly includes "Public Holidays" (e.g. "Friday, Saturday, Public Holidays"), add the country's fixed-date public holidays to the Weekend season's specificDates array for the year(s) the rate list covers. For Kenya: Jan 1 (New Year), May 1 (Labour), Jun 1 (Madaraka), Oct 10 (Huduma), Oct 20 (Mashujaa), Dec 12 (Jamhuri), Dec 25 (Christmas), Dec 26 (Boxing). Skip Easter, Eid, and Diyas — they move each year and operators can add them manually.
 - "Per person sharing" and "pp sharing" and "Per person in double" all mean perPersonSharing.
 - Parse child policy into brackets. Free ages → mode="free". % of adult → mode="pct". Absolute amount → mode="flat".
-- CURRENCY ON SUPPLEMENTS: if the PDF states a supplement in a different currency than the main rates (e.g. "US$40" Christmas supplement on a KES rate card), set the supplement's currency field to that currency (USD). If no explicit currency is given, omit the field.
+- CURRENCY ON SUPPLEMENTS AND ADD-ONS: if the PDF states a supplement OR add-on in a different currency than the main rates (e.g. "US$40" Christmas supplement or "USD 250 per day" vehicle hire on a KES rate card), set that item's currency field to its explicit currency (USD). If the PDF gives the amount without a currency symbol, inherit the rate list currency and omit the field.
 - Park fees, community fees, and government levies go in passThroughFees, NOT in nightly pricing.
+- FLAT vs TIERED pass-through fees: if the PDF publishes ONE fee that everyone pays regardless of nationality (common for private conservancies — Chui/Oserengoni, Ol Pejeta day visits, etc.), populate a single tieredRows entry with the SAME value in adultCitizen, adultResident, AND adultNonResident (and the same for child fields). Do not leave any nationality column at zero — the resolver picks by the quote's nationality, and a zero means "this guest doesn't pay" which is almost never true. Use distinct values per column only when the PDF itself shows different prices by nationality (Mara Reserve Fee, SENAPA, MMNR).
 - Drinks packages, vehicle hire, massages go in addOns.
 - If a value isn't present in the PDF, omit the field or set it to 0 — don't invent numbers.
 - All monetary values as bare numbers (no currency symbols, no commas).
