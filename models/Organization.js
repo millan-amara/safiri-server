@@ -36,6 +36,11 @@ const organizationSchema = new mongoose.Schema({
     taskReminderHours: { type: Number, default: 24 },
   },
 
+  // FX rates — "1 unit of KEY = fxRates[KEY] units of defaults.currency".
+  // Overrides the server-wide default table. Operators can tune their book rate.
+  // Empty object = use server defaults in utils/fx.js.
+  fxRates: { type: mongoose.Schema.Types.Mixed, default: {} },
+
   // ─── Subscription & billing ────────────────────────────────────────────────
   subscriptionStatus: {
     type: String,

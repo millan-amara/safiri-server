@@ -39,6 +39,22 @@ const dealSchema = new mongoose.Schema({
   tripType: { type: String, enum: ['safari', 'beach', 'honeymoon', 'family', 'corporate', 'adventure', 'cultural', 'mixed', ''], default: '' },
   interests: [String],                                   // safari, beach, culture, etc.
   specialRequests: { type: String, default: '' },
+
+  // Which rate sheet the operator should quote from.
+  // 'retail' = walk-in/public rack; 'contract' = DMC/agent/STO; 'resident' = EA/citizen pricing.
+  clientType: {
+    type: String,
+    enum: ['retail', 'contract', 'resident'],
+    default: 'retail',
+  },
+  // Used to resolve nationality-tiered pass-through fees (park fees etc.).
+  // 'citizen' = passport of the operating country; 'resident' = East African
+  // Community resident with proof; 'nonResident' = international visitor.
+  nationality: {
+    type: String,
+    enum: ['citizen', 'resident', 'nonResident'],
+    default: 'nonResident',
+  },
   
   // Sales tracking
   leadSource: { type: String, enum: ['website', 'referral', 'repeat', 'travel_agent', 'social', 'email', 'phone', 'walk_in', 'other', ''], default: '' },

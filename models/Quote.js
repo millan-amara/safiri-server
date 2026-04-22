@@ -64,6 +64,18 @@ const quoteSchema = new mongoose.Schema({
   endDate: { type: Date },
   startPoint: { type: String, default: 'Nairobi' },
   endPoint: { type: String, default: 'Nairobi' },
+
+  // Client/audience segmentation — drives rate-list resolution.
+  clientType: {
+    type: String,
+    enum: ['retail', 'contract', 'resident'],
+    default: 'retail',
+  },
+  nationality: {
+    type: String,
+    enum: ['citizen', 'resident', 'nonResident'],
+    default: 'nonResident',
+  },
   
   // The itinerary — days are the source of truth
   days: [daySchema],
@@ -112,6 +124,11 @@ const quoteSchema = new mongoose.Schema({
       unitPrice: Number,         // Marked-up price
       total: Number,
     }],
+
+    // FX snapshot — locks the conversion rates used when this quote's prices
+    // were calculated, so a later FX move doesn't silently rewrite the total.
+    // Keys are source currencies; values are "1 unit of source = N units of quote currency".
+    fxRates: { type: mongoose.Schema.Types.Mixed, default: {} },
   },
   
   // Inclusions / Exclusions

@@ -301,15 +301,32 @@ Respond ONLY with this JSON structure, nothing else:
 
 router.post('/draft-itinerary', heavy, logAiCall('draft-itinerary'), async (req, res) => {
   try {
-    const { prompt, tripLength, travelers, budget } = req.body;
+    const {
+      prompt,
+      tripLength,
+      travelers,
+      budget,
+      // New: passed through to the rate resolver so nightly costs reflect
+      // the real deal configuration rather than hotel.rates[0].
+      startDate,
+      adults,
+      childAges = [],
+      clientType = 'retail',
+      nationality = 'nonResident',
+      quoteCurrency,
+      preferredMealPlan,
+    } = req.body;
     if (!prompt?.trim()) return res.status(400).json({ message: 'Prompt required' });
 
-    // Pull the operator's partner data so the AI can suggest real hotels/activities.
-    // Pre-filter by destinations mentioned in the prompt so the prompt stays bounded
-    // even for orgs with thousands of records — keeps Claude costs predictable.
     const Hotel = (await import('../models/Hotel.js')).default;
     const Activity = (await import('../models/Activity.js')).default;
     const Destination = (await import('../models/Destination.js')).default;
+    const { priceStay, summarizeCheapestRate } = await import('../services/rateResolver.js');
+
+    const effectiveCurrency = quoteCurrency || req.organization?.defaults?.currency || 'USD';
+    const orgFxOverrides = req.organization?.fxRates || {};
+    const effectiveAdults = adults || travelers || 2;
+    const effectiveStart = startDate ? new Date(startDate) : null;
 
     const MAX_CATALOG_PER_TYPE = 60;
 
@@ -370,7 +387,7 @@ Respond ONLY with JSON: { "destinations": ["ExactName1", "ExactName2"] }`;
     }
 
     const hotels = await Hotel.find(hotelFilter)
-      .select('name destination category description rates')
+      .select('name destination type description rateLists currency images')
       .sort({ updatedAt: -1 })
       .limit(MAX_CATALOG_PER_TYPE)
       .lean();
@@ -380,13 +397,22 @@ Respond ONLY with JSON: { "destinations": ["ExactName1", "ExactName2"] }`;
       .limit(MAX_CATALOG_PER_TYPE)
       .lean();
 
-    // Build a compact catalog the AI can reference by name
-    const hotelCatalog = hotels.map(h => ({
-      name: h.name,
-      destination: h.destination,
-      category: h.category,
-      pricing: h.rates?.[0] ? `${h.rates[0].ratePerNight} ${h.rates[0].currency || 'USD'}/night` : 'N/A',
-    }));
+    // Build a compact catalog the AI can reference by name. Use the rate
+    // resolver's summary so Claude sees the right audience's price.
+    const hotelCatalog = hotels.map(h => {
+      const summary = summarizeCheapestRate(h, {
+        clientType,
+        date: effectiveStart || new Date(),
+        quoteCurrency: effectiveCurrency,
+        orgFxOverrides,
+      });
+      return {
+        name: h.name,
+        destination: h.destination,
+        type: h.type,
+        pricing: summary?.label || 'No matching rate list',
+      };
+    });
     const activityCatalog = activities.map(a => ({
       name: a.name,
       destination: a.destination,
@@ -446,29 +472,80 @@ Generate the full itinerary as JSON.`;
       return res.status(500).json({ message: 'AI returned invalid format. Try rephrasing your prompt.' });
     }
 
-    // Resolve hotel and activity references from names to full objects
+    // Resolve hotel and activity references from names to full objects.
+    // For hotels, run the rate resolver with the trip's checkIn = startDate + i
+    // and checkOut = +1 night, so per-day pricing reflects real season / audience.
     const resolvedDays = (parsed.days || []).map((day, i) => {
       let hotel = null;
       if (day.hotelName) {
         const found = hotels.find(h => h.name === day.hotelName);
         if (found) {
-          const rate = found.rates?.[0];
-          hotel = {
-            hotelId: found._id,
-            name: found.name,
-            roomType: rate?.roomType || '',
-            ratePerNight: rate?.ratePerNight || 0,
-            mealPlan: rate?.mealPlan || '',
-            images: found.images || [],
-            description: found.description || '',
-          };
+          const checkIn = effectiveStart ? new Date(effectiveStart) : new Date();
+          checkIn.setDate(checkIn.getDate() + i);
+          const checkOut = new Date(checkIn);
+          checkOut.setDate(checkOut.getDate() + 1);
+
+          const priced = priceStay({
+            hotel: found,
+            checkIn,
+            checkOut,
+            pax: { adults: effectiveAdults, childAges },
+            clientType,
+            nationality,
+            preferredMealPlan,
+            quoteCurrency: effectiveCurrency,
+            orgFxOverrides,
+          });
+
+          if (priced.ok) {
+            const night = priced.nightly[0] || {};
+            hotel = {
+              hotelId: found._id,
+              name: found.name,
+              images: found.images || [],
+              description: found.description || '',
+              // Rate list snapshot
+              rateListId: priced.rateList._id,
+              rateListName: priced.rateList.name,
+              audienceApplied: priced.rateList.audience,
+              mealPlan: priced.rateList.mealPlan,
+              mealPlanLabel: priced.rateList.mealPlanLabel || '',
+              sourceCurrency: priced.sourceCurrency,
+              fxRate: priced.fxRate,
+              // Per-night rollup
+              roomType: priced.roomType,
+              seasonLabel: night.season,
+              ratePerNight: night.total || 0,                              // source currency
+              ratePerNightInQuoteCurrency: (night.total || 0) * priced.fxRate,
+              supplements: night.supplements || [],
+              // Surfaced but not added to nightly cost — caller can itemize
+              passThroughFees: priced.passThroughFees,
+              addOns: priced.addOns,
+              cancellationTiers: priced.cancellationTiers,
+              depositPct: priced.depositPct,
+              warnings: priced.warnings,
+            };
+          } else {
+            // Pricing couldn't resolve — keep a thin snapshot so the UI
+            // surfaces "no rate available" rather than silently dropping the pick.
+            hotel = {
+              hotelId: found._id,
+              name: found.name,
+              images: found.images || [],
+              description: found.description || '',
+              ratePerNight: 0,
+              ratePerNightInQuoteCurrency: 0,
+              sourceCurrency: found.currency || effectiveCurrency,
+              warnings: [priced.reason || 'pricing_unavailable', ...(priced.warnings || [])],
+            };
+          }
         }
       }
 
       const dayActivities = (day.suggestedActivities || []).map(name => {
         const found = activities.find(a => a.name === name);
         if (!found) return null;
-        const totalPax = travelers || 2;
+        const totalPax = effectiveAdults + (childAges?.length || 0);
         const totalCost = found.costPerPerson ? found.costPerPerson * totalPax : (found.groupRate || 0);
         return {
           activityId: found._id,
@@ -481,7 +558,7 @@ Generate the full itinerary as JSON.`;
         };
       }).filter(Boolean);
 
-      const hotelCost = hotel?.ratePerNight || 0;
+      const hotelCost = hotel?.ratePerNightInQuoteCurrency || hotel?.ratePerNight || 0;
       const actCost = dayActivities.reduce((s, a) => s + (a.totalCost || 0), 0);
 
       return {
