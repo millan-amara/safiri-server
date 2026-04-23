@@ -235,9 +235,10 @@ function supplementsForNight(season, date, pax, rooms, rateListCurrency, orgFxOv
   const totalAdults = rooms.reduce((s, r) => s + r.adults, 0);
   const totalChildren = rooms.reduce((s, r) => s + r.children, 0);
   return applicable.map(s => {
-    const amountPerPerson = (Number(s.amountPerPerson) || 0) * (totalAdults + totalChildren);
-    const amountPerRoom = (Number(s.amountPerRoom) || 0) * rooms.length;
-    const nativeAmount = amountPerPerson + amountPerRoom;
+    const adultAmt = (Number(s.amountPerPerson) || 0) * totalAdults;
+    const childAmt = (Number(s.amountPerChild) || 0) * totalChildren;
+    const roomAmt = (Number(s.amountPerRoom) || 0) * rooms.length;
+    const nativeAmount = adultAmt + childAmt + roomAmt;
     const nativeCurrency = s.currency || rateListCurrency;
     const amountInSource = nativeCurrency === rateListCurrency
       ? nativeAmount

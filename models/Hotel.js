@@ -43,12 +43,18 @@ const dateRangeSchema = new mongoose.Schema({
 }, { _id: false });
 
 // Date-specific price bump inside a season (Christmas/NYE, shoulder weeks).
-// Can be per-person or per-room, and typically applies only on nights that
+// Can be per-adult, per-child, per-room, and applies only on nights that
 // fall inside `dates`.
 const supplementSchema = new mongoose.Schema({
   name: { type: String, required: true },
   dates: [dateRangeSchema],
+  // Adult supplement amount. Kept as `amountPerPerson` for back-compat; the
+  // UI labels it "Per Adult" and the resolver only applies it to adults.
   amountPerPerson: { type: Number, default: 0 },
+  // Child supplement amount. 0 = children exempt from this supplement.
+  // Chui: $40 adult, $20 child. Use the adult amount here if the PDF says
+  // "same for all guests".
+  amountPerChild: { type: Number, default: 0 },
   amountPerRoom: { type: Number, default: 0 },
   // Supplements can be priced in a different currency than the rate list.
   // Chui Lodge is the canonical example: rooms in KES, Christmas/Easter

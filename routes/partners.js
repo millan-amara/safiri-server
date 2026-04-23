@@ -206,7 +206,7 @@ You MUST respond with ONLY valid JSON — no markdown, no commentary. The schema
             }
           ],
           "supplements": [
-            { "name": "Christmas/NYE", "dates": [{ "from": "YYYY-MM-DD", "to": "YYYY-MM-DD" }], "amountPerPerson": number, "amountPerRoom": number, "currency": "USD" | "KES" | ... (omit to inherit rate list currency), "mandatory": true }
+            { "name": "Christmas/NYE", "dates": [{ "from": "YYYY-MM-DD", "to": "YYYY-MM-DD" }], "amountPerPerson": number (per adult), "amountPerChild": number (per child, 0 = exempt), "amountPerRoom": number, "currency": "USD" | "KES" | ... (omit to inherit rate list currency), "mandatory": true }
           ]
         }
       ],
@@ -239,6 +239,7 @@ Rules:
 - "Per person sharing" and "pp sharing" and "Per person in double" all mean perPersonSharing.
 - Parse child policy into brackets. Free ages → mode="free". % of adult → mode="pct". Absolute amount → mode="flat".
 - CURRENCY ON SUPPLEMENTS AND ADD-ONS: if the PDF states a supplement OR add-on in a different currency than the main rates (e.g. "US$40" Christmas supplement or "USD 250 per day" vehicle hire on a KES rate card), set that item's currency field to its explicit currency (USD). If the PDF gives the amount without a currency symbol, inherit the rate list currency and omit the field.
+- CHILD SUPPLEMENTS: supplements have amountPerPerson (adult) and amountPerChild (child). If the PDF says "per adult, half price for children" ($40 adult / $20 child), set amountPerPerson=40 and amountPerChild=20. If the PDF says "per person" without distinction, set both equal. If the PDF says children are exempt, set amountPerChild=0. Do not leave amountPerChild unset when the PDF specifies child pricing.
 - Park fees, community fees, and government levies go in passThroughFees, NOT in nightly pricing.
 - FLAT vs TIERED pass-through fees: if the PDF publishes ONE fee that everyone pays regardless of nationality (common for private conservancies — Chui/Oserengoni, Ol Pejeta day visits, etc.), populate a single tieredRows entry with the SAME value in adultCitizen, adultResident, AND adultNonResident (and the same for child fields). Do not leave any nationality column at zero — the resolver picks by the quote's nationality, and a zero means "this guest doesn't pay" which is almost never true. Use distinct values per column only when the PDF itself shows different prices by nationality (Mara Reserve Fee, SENAPA, MMNR).
 - Drinks packages, vehicle hire, massages go in addOns.
