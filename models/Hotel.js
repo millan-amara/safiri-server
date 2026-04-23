@@ -26,11 +26,19 @@ const childBracketSchema = new mongoose.Schema({
 const roomPricingSchema = new mongoose.Schema({
   roomType: { type: String, required: true },         // "Standard", "Deluxe", "Family Suite"
   maxOccupancy: { type: Number, default: 2 },
-  singleOccupancy: { type: Number, default: 0 },      // solo traveler per night
-  perPersonSharing: { type: Number, default: 0 },     // standard "dbl" per-person rate
-  triplePerPerson: { type: Number, default: 0 },      // per-person in a triple share
-  quadPerPerson: { type: Number, default: 0 },        // per-person in a quad share
-  singleSupplement: { type: Number, default: 0 },     // when a solo uses a dbl/twin; added on top of perPersonSharing
+  // How the double/triple/quad numbers are published:
+  //   'per_person'     — Chui-style: each value is one person's share.
+  //                       Resolver multiplies by adult count.
+  //   'per_room_total' — AA-Lodges-style: each value is the whole room's
+  //                       nightly total. Resolver uses as-is, no multiplication.
+  // Single-occupancy is ALWAYS a one-person total in either mode.
+  // Child pricing derives an effective per-person in per_room_total mode.
+  pricingMode: { type: String, enum: ['per_person', 'per_room_total'], default: 'per_person' },
+  singleOccupancy: { type: Number, default: 0 },      // solo traveler per night (always total)
+  perPersonSharing: { type: Number, default: 0 },     // double: per-person OR room total depending on pricingMode
+  triplePerPerson: { type: Number, default: 0 },      // triple: per-person OR room total depending on pricingMode
+  quadPerPerson: { type: Number, default: 0 },        // quad: per-person OR room total depending on pricingMode
+  singleSupplement: { type: Number, default: 0 },     // only meaningful in per_person mode (solo using a double)
   childBrackets: [childBracketSchema],
   notes: String,
 }, { _id: false });
@@ -160,6 +168,12 @@ const rateListSchema = new mongoose.Schema({
   cancellationTiers: [cancellationTierSchema],
   depositPct: { type: Number, default: 0 },
   bookingTerms: { type: String, default: '' },
+  // Rate-list-level inclusions and exclusions. What's bundled into the nightly
+  // rate (e.g. full-board, drinks, game drives) and what's explicitly NOT
+  // (premium spirits, massages). Shown per-hotel on the quote so the client
+  // sees exactly what they're paying for at each lodge.
+  inclusions: { type: [String], default: [] },
+  exclusions: { type: [String], default: [] },
   notes: { type: String, default: '' },
   isActive: { type: Boolean, default: true },
 }, { _id: true });

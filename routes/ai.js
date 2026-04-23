@@ -523,6 +523,8 @@ Generate the full itinerary as JSON.`;
               addOns: priced.addOns,
               cancellationTiers: priced.cancellationTiers,
               depositPct: priced.depositPct,
+              inclusions: priced.inclusions || [],
+              exclusions: priced.exclusions || [],
               warnings: priced.warnings,
             };
           } else {

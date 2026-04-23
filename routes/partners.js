@@ -161,9 +161,26 @@ router.post('/hotels/extract-pdf',
       const base64 = req.file.buffer.toString('base64');
       const knownDestination = req.body?.destination || '';
 
-      const systemPrompt = `You extract hotel rate cards into structured JSON for a safari-itinerary app.
+      const systemPrompt = `You extract hotel information into structured JSON for a safari-itinerary app.
 
-You MUST respond with ONLY valid JSON — no markdown, no commentary. The schema is:
+The PDF can be ANY of these document types, or combinations of them:
+  (a) A rate card with pricing tables (Chui, AA Lodges, Acacia).
+  (b) A Terms & Conditions document with cancellation, deposit, payment policies.
+  (c) A property info / fact sheet with description, amenities, bedroom count, nearest airport.
+  (d) A multi-hotel chain document with several properties (AA Lodges Masai Mara + Amboseli).
+  (e) A bundle — rate tables + T&Cs + info all on the same pages.
+
+Extract WHATEVER is present. Do NOT fail or return empty if rate tables are missing — an info sheet with only description and amenities is still valid input. Fields you cannot populate should be omitted from the output (not set to empty strings or zero).
+
+ALWAYS return an array of hotels in the "hotels" field, even if only one is present. Shared Terms & Policies (cancellation, deposit, booking terms, child policy, inclusions) apply to every hotel in the document — duplicate the same values across each hotel's rateLists if rate lists exist. If there are no rate lists, still capture the T&Cs but leave rateLists as an empty array.
+
+You MUST respond with ONLY valid JSON — no markdown, no commentary. The top-level shape is:
+{
+  "hotels": [HotelObject, HotelObject, ...],
+  "warnings": ["array of strings flagging ambiguities — e.g. 'Could not parse Easter supplement dates'"]
+}
+
+Each HotelObject follows this schema:
 {
   "name": "string",
   "destination": "string — region/national park",
@@ -195,6 +212,7 @@ You MUST respond with ONLY valid JSON — no markdown, no commentary. The schema
             {
               "roomType": "Standard" | "Deluxe" | "Family Suite" | ...,
               "maxOccupancy": number,
+              "pricingMode": "per_person" | "per_room_total",
               "singleOccupancy": number,
               "perPersonSharing": number,
               "triplePerPerson": number,
@@ -224,28 +242,41 @@ You MUST respond with ONLY valid JSON — no markdown, no commentary. The schema
       "cancellationTiers": [
         { "daysBefore": 60, "penaltyPct": 25 },
         { "daysBefore": 30, "penaltyPct": 50 }
-      ]
+      ],
+      "inclusions": ["Full-board - all meals & accommodation", "Soft drinks, local beers, house wines", "Shared game drives", "VAT & taxes"],
+      "exclusions": ["Daily conservation fees", "Premium spirits, wines, Champagne", "Massages & treatments", "Gratuities to staff & guides"]
     }
-  ],
-  "warnings": ["array of strings for ambiguities — e.g. 'Could not parse Easter supplement dates'"]
+  ]
 }
-
 Rules:
 - If the PDF has Rack + STO side by side, produce TWO rate lists (different audience).
 - If the PDF has a separate Resident pricelist in local currency (KES, TZS, UGX), produce a rate list with audience=["resident"] and that currency.
 - If a season has multiple disjoint date windows (e.g. High = Jan 1–10 + Jul 1–Aug 31 + Dec 18–31), put all ranges in dateRanges.
 - WEEKDAY vs WEEKEND pricing: if the PDF has two price columns like "Friday, Saturday, Public Holidays" vs "Sunday to Thursday", emit TWO seasons covering the same date range — one with daysOfWeek=[5,6] labeled "Weekend", one with daysOfWeek=[0,1,2,3,4] labeled "Weekday". (0=Sun..6=Sat.) Each season has its own room pricing from the matching column. Omit daysOfWeek entirely when the PDF has only one set of rates for the period.
 - PUBLIC HOLIDAYS: if the weekend column explicitly includes "Public Holidays" (e.g. "Friday, Saturday, Public Holidays"), add the country's fixed-date public holidays to the Weekend season's specificDates array for the year(s) the rate list covers. For Kenya: Jan 1 (New Year), May 1 (Labour), Jun 1 (Madaraka), Oct 10 (Huduma), Oct 20 (Mashujaa), Dec 12 (Jamhuri), Dec 25 (Christmas), Dec 26 (Boxing). Skip Easter, Eid, and Diyas — they move each year and operators can add them manually.
-- "Per person sharing" and "pp sharing" and "Per person in double" all mean perPersonSharing.
+- "Per person sharing" and "pp sharing" and "Per person in double" all mean perPersonSharing with pricingMode="per_person".
+- PRICING MODE detection — critical: some PDFs publish per-person rates ("USD 675 per person per night"), others publish TOTAL ROOM rates per column (Single/Twin-Double/Triple as columns of absolute room totals). Detect this by:
+  (a) Explicit wording ("per person", "pp", "pax" → per_person; "per room", "total", no per-person marker → per_room_total).
+  (b) Math check: if the Double number is less than 2× the Single number, it is almost certainly per_room_total (otherwise sharing would cost more than solo, which is nonsense). AA Lodges agent rate cards, many Kenyan contract sheets, and most resident pricelists use per_room_total — columns labeled SINGLE / TWIN/DOUBLE / TRIPLE without a "per person" header typically mean total per room.
+  Set pricingMode on EACH roomPricing entry. Default "per_person" only when you are genuinely sure; otherwise flag in warnings.
 - Parse child policy into brackets. Free ages → mode="free". % of adult → mode="pct". Absolute amount → mode="flat".
+- WHERE TO FIND CHILD POLICY: scan the ENTIRE document. If the PDF has a combined rate-card + Terms & Policies layout (AA Lodges, Serena, Sarova), the Child Policy is usually in a numbered section on a later page ("4. Child Policy", "Children Rates", etc.), NOT in the rate tables. When found there, duplicate the parsed brackets into EVERY room of EVERY season of EVERY rate list you return — the policy applies to all properties and audiences uniformly. Common AA-Lodges-style parsing:
+    * "Up to 3 years sharing with adult/s - No Charge" → { minAge: 0, maxAge: 3, mode: "free", sharingRule: "sharing_with_adults" }
+    * "Over 3 up to 12 years sharing with 1 or 2 adults - 50% of applicable per person adult double room rate" → { minAge: 4, maxAge: 12, mode: "pct", value: 50, sharingRule: "sharing_with_adults" }
+    * "Over 12 up to 16 years sharing with 1 or 2 adults - 75%" → { minAge: 13, maxAge: 16, mode: "pct", value: 75, sharingRule: "sharing_with_adults" }
+    * "Up to 16 years having exclusive use of room - 75% of full adult single/double/triple rate" → { minAge: 0, maxAge: 16, mode: "pct", value: 75, sharingRule: "own_room" }
+- SAME FOR CANCELLATION / DEPOSIT / PAYMENT TERMS: if the document has a separate Terms & Policies section, parse Cancellation and No-Shows into cancellationTiers, the deposit clause into depositPct, and the payment/jurisdiction clauses into bookingTerms. Duplicate across every hotel/rate list in the document.
 - CURRENCY ON SUPPLEMENTS AND ADD-ONS: if the PDF states a supplement OR add-on in a different currency than the main rates (e.g. "US$40" Christmas supplement or "USD 250 per day" vehicle hire on a KES rate card), set that item's currency field to its explicit currency (USD). If the PDF gives the amount without a currency symbol, inherit the rate list currency and omit the field.
 - CHILD SUPPLEMENTS: supplements have amountPerPerson (adult) and amountPerChild (child). If the PDF says "per adult, half price for children" ($40 adult / $20 child), set amountPerPerson=40 and amountPerChild=20. If the PDF says "per person" without distinction, set both equal. If the PDF says children are exempt, set amountPerChild=0. Do not leave amountPerChild unset when the PDF specifies child pricing.
 - Park fees, community fees, and government levies go in passThroughFees, NOT in nightly pricing.
+- INCLUSIONS and EXCLUSIONS: every supplier PDF has an INCLUDED and EXCLUDED section (Chui, Spekes, Acacia all do). Extract each bullet as a string into the "inclusions" / "exclusions" arrays on the rate list. Keep each item short and client-readable. Items priced as add-ons in the excluded section ("Extra lunch pp USD 40", "Land Cruiser USD 250/day") should appear in BOTH the "exclusions" array (so the client sees it is not included) AND in the "addOns" array (structured so the quote builder can offer them).
 - FLAT vs TIERED pass-through fees: if the PDF publishes ONE fee that everyone pays regardless of nationality (common for private conservancies — Chui/Oserengoni, Ol Pejeta day visits, etc.), populate a single tieredRows entry with the SAME value in adultCitizen, adultResident, AND adultNonResident (and the same for child fields). Do not leave any nationality column at zero — the resolver picks by the quote's nationality, and a zero means "this guest doesn't pay" which is almost never true. Use distinct values per column only when the PDF itself shows different prices by nationality (Mara Reserve Fee, SENAPA, MMNR).
 - Drinks packages, vehicle hire, massages go in addOns.
 - If a value isn't present in the PDF, omit the field or set it to 0 — don't invent numbers.
 - All monetary values as bare numbers (no currency symbols, no commas).
-- All dates as YYYY-MM-DD.`;
+- All dates as YYYY-MM-DD.
+- MULTI-HOTEL DOCUMENTS: if the PDF has separate sections or tables for different properties (AA Lodge Masai Mara and AA Lodge Amboseli, Serena properties, etc.), return one HotelObject per property in the top-level "hotels" array. Shared Terms & Policies (cancellation, deposit, booking terms, inclusions) apply to all properties — copy them into each hotel's rateLists.
+- INFO / FACT SHEETS without rate tables: when the PDF is a property description (e.g. a "Key Info" sheet with bedrooms, amenities, nearest-beach distance), extract "name", "destination", "location", "type", "description" (the marketing prose), and "amenities" (flatten every feature from Pool, General, Standard, Utilities, Outdoors, Access tables into a single amenities string array — skip trivia like furniture counts, wheelchair suitability, pet/smoking rules which don't belong on a client quote). Leave "rateLists" as an empty array. DO NOT invent rates.`;
 
       const userText = [
         'Extract the hotel rate card from this PDF into the JSON schema above.',
@@ -262,15 +293,21 @@ Rules:
         },
         body: JSON.stringify({
           model: 'claude-sonnet-4-20250514',
-          max_tokens: 8192,
+          max_tokens: 16000,
           system: systemPrompt,
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
-              { type: 'text', text: userText },
-            ],
-          }],
+          messages: [
+            {
+              role: 'user',
+              content: [
+                { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } },
+                { type: 'text', text: userText },
+              ],
+            },
+            // Prefill forces Claude's response to start with "{" — no natural-language
+            // preamble, no "Here is the JSON you requested:". The prefill is prepended
+            // back before parsing.
+            { role: 'assistant', content: '{' },
+          ],
         }),
       });
 
@@ -280,21 +317,45 @@ Rules:
       }
 
       const data = await response.json();
-      const raw = data.content?.[0]?.text || '';
+      const stopReason = data.stop_reason;
+      // Reconstruct full JSON with the prefilled "{"
+      const raw = '{' + (data.content?.[0]?.text || '');
       const cleaned = raw.replace(/```json\s*|\s*```/g, '').trim();
       const start = cleaned.indexOf('{');
       const end = cleaned.lastIndexOf('}');
+
       if (start === -1 || end === -1) {
-        return res.status(422).json({ message: 'Claude returned non-JSON response', raw: raw.slice(0, 500) });
+        console.error('[extract-pdf] Non-JSON response. stop_reason=%s raw=%s', stopReason, raw.slice(0, 800));
+        return res.status(422).json({
+          message: stopReason === 'max_tokens'
+            ? 'The PDF is too dense and the extraction ran out of space. Try splitting the rate card into separate PDFs.'
+            : 'Claude returned non-JSON response. Try again, or enter data manually.',
+          stopReason,
+        });
       }
       let parsed;
       try {
         parsed = JSON.parse(cleaned.substring(start, end + 1));
       } catch (e) {
-        return res.status(422).json({ message: 'Claude JSON parse failed', detail: e.message, raw: raw.slice(0, 500) });
+        console.error('[extract-pdf] JSON parse failed. stop_reason=%s err=%s raw=%s', stopReason, e.message, raw.slice(0, 800));
+        return res.status(422).json({
+          message: stopReason === 'max_tokens'
+            ? 'The PDF is too dense and the extraction was truncated mid-JSON. Try splitting the rate card into separate PDFs.'
+            : 'Claude returned malformed JSON. Try again, or enter data manually.',
+          stopReason,
+          detail: e.message,
+        });
       }
 
-      res.json({ draft: parsed });
+      // Normalize to the hotels[] shape. If Claude returned a single HotelObject
+      // (legacy shape), wrap it; if it returned the new { hotels: [...] } shape,
+      // pass through. Warnings live at the top level either way.
+      const hotels = Array.isArray(parsed?.hotels)
+        ? parsed.hotels
+        : (parsed && typeof parsed === 'object' ? [parsed] : []);
+      const warnings = Array.isArray(parsed?.warnings) ? parsed.warnings : [];
+
+      res.json({ drafts: hotels, warnings });
     } catch (error) {
       console.error('PDF extract error:', error);
       res.status(500).json({ message: error.message });

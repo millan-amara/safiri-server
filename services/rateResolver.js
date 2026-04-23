@@ -154,12 +154,21 @@ function pickBracket(brackets = [], age, inOwnRoom) {
   return byRule || candidates[0];
 }
 
+// Returns the per-person-equivalent of a sharing rate. In per_person mode
+// perPersonSharing IS the per-person value; in per_room_total mode it's the
+// double-room total and needs dividing by 2 for per-person child pricing etc.
+function effectivePerPerson(roomPricing) {
+  const rate = Number(roomPricing.perPersonSharing) || 0;
+  if (roomPricing.pricingMode === 'per_room_total') return rate / 2;
+  return rate;
+}
+
 function childCost(bracket, roomPricing, inOwnRoom) {
   if (!bracket) return { amount: 0, mode: 'missing_bracket' };
   if (bracket.mode === 'free') return { amount: 0, mode: 'free' };
   if (bracket.mode === 'flat') return { amount: Number(bracket.value) || 0, mode: 'flat' };
-  // pct: apply against perPersonSharing (if sharing) or singleOccupancy (if own room)
-  const base = inOwnRoom ? (roomPricing.singleOccupancy || 0) : (roomPricing.perPersonSharing || 0);
+  // pct: apply against effective per-person rate (sharing) or singleOccupancy (own room)
+  const base = inOwnRoom ? (roomPricing.singleOccupancy || 0) : effectivePerPerson(roomPricing);
   return { amount: base * (Number(bracket.value) || 0) / 100, mode: 'pct' };
 }
 
@@ -173,25 +182,35 @@ function priceRoomSlot(slot, roomPricing, childAges) {
   let base = 0;
   const breakdown = [];
 
+  const isPerRoom = roomPricing.pricingMode === 'per_room_total';
+
   if (slot.occupancy === 'single') {
     if (slot.adults) {
+      // Single is always a total for one person — no mode ambiguity.
       base += (roomPricing.singleOccupancy || 0) * slot.adults;
       breakdown.push({ kind: 'adult_single', count: slot.adults, perUnit: roomPricing.singleOccupancy });
     }
   } else {
-    const perPersonKey = {
+    const storageKey = {
       double: 'perPersonSharing',
       triple: 'triplePerPerson',
       quad: 'quadPerPerson',
     }[slot.occupancy];
-    const perPerson = roomPricing[perPersonKey] || roomPricing.perPersonSharing || 0;
+    const stored = roomPricing[storageKey] || roomPricing.perPersonSharing || 0;
     if (slot.adults) {
-      base += perPerson * slot.adults;
-      breakdown.push({ kind: `adult_${slot.occupancy}`, count: slot.adults, perUnit: perPerson });
+      if (isPerRoom) {
+        // Stored value is the whole room's nightly total. One charge per room,
+        // not per adult, regardless of how many adults are actually in it.
+        base += stored;
+        breakdown.push({ kind: `room_${slot.occupancy}`, count: 1, perUnit: stored });
+      } else {
+        base += stored * slot.adults;
+        breakdown.push({ kind: `adult_${slot.occupancy}`, count: slot.adults, perUnit: stored });
+      }
     }
-    // Apply single supplement if a solo traveler is occupying a sharing-rate room
-    // (e.g. couple rate but only one adult). Rare for double unless rooms specifies.
-    if (slot.adults === 1 && slot.occupancy === 'double' && roomPricing.singleSupplement) {
+    // Single supplement only makes sense in per_person mode (where a solo
+    // in a double pays the double per-person rate plus a supplement).
+    if (!isPerRoom && slot.adults === 1 && slot.occupancy === 'double' && roomPricing.singleSupplement) {
       base += roomPricing.singleSupplement;
       breakdown.push({ kind: 'single_supplement', count: 1, perUnit: roomPricing.singleSupplement });
     }
@@ -474,6 +493,8 @@ export function priceStay({
     cancellationTiers: rateList.cancellationTiers || [],
     depositPct: rateList.depositPct || 0,
     bookingTerms: rateList.bookingTerms || '',
+    inclusions: rateList.inclusions || [],
+    exclusions: rateList.exclusions || [],
     notes: rateList.notes || '',
     warnings,
   };
