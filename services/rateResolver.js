@@ -300,50 +300,81 @@ function supplementsForNight(season, date, pax, rooms, rateListCurrency, orgFxOv
 }
 
 // ─── Pass-through fees ─────────────────────────────────────────────────
-function resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, nights) {
+// nightDates is the actual array of night dates from eachNight(). We walk
+// each night and pick the tiered row whose validity covers THAT night,
+// so a stay straddling a fee transition (e.g. Mara/Amboseli park fee that
+// jumps on Jul 1) gets the correct $/night for each portion of the stay.
+// The old behaviour picked one row for the whole stay and silently dropped
+// fees when the stay straddled a boundary.
+function resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, nightDates) {
+  const nights = Array.isArray(nightDates) ? nightDates : [];
   const out = [];
+
+  const adultKey = nationality === 'citizen' ? 'adultCitizen'
+                 : nationality === 'resident' ? 'adultResident'
+                 : 'adultNonResident';
+  const childKey = nationality === 'citizen' ? 'childCitizen'
+                 : nationality === 'resident' ? 'childResident'
+                 : 'childNonResident';
+
   for (const fee of (rateList.passThroughFees || [])) {
     const feeCurrency = fee.currency || rateList.currency;
+    const tiered = fee.tieredRows || [];
 
-    // Find an applicable row (by date) in the tiered table, else use flatAmount
-    const row = (fee.tieredRows || []).find(r => {
+    // Find the row covering a given night. A row without dates applies to
+    // every night (open row). First match wins if ranges overlap.
+    const rowForNight = (d) => tiered.find(r => {
       if (!r.validFrom || !r.validTo) return true;
-      return new Date(checkIn) >= new Date(r.validFrom) && new Date(checkOut) <= new Date(r.validTo);
+      const t = new Date(d).getTime();
+      return t >= new Date(r.validFrom).getTime() && t <= new Date(r.validTo).getTime();
     });
 
-    const adultKey = nationality === 'citizen' ? 'adultCitizen'
-                   : nationality === 'resident' ? 'adultResident'
-                   : 'adultNonResident';
-    const childKey = nationality === 'citizen' ? 'childCitizen'
-                   : nationality === 'resident' ? 'childResident'
-                   : 'childNonResident';
+    // Per-night contribution in the fee's published units.
+    const nightAmount = (row) => {
+      const adultRate = row ? (row[adultKey] || 0) : (fee.flatAmount || 0);
+      const childRate = row ? (row[childKey] || 0) : 0;
+      const childEligible = row
+        ? pax.childAges.filter(a => a >= (row.childMinAge || 0) && a <= (row.childMaxAge || 17)).length
+        : pax.childAges.length;
+      if (fee.unit === 'per_room_per_night') {
+        // Approximation: adults proxy rooms until the quote builder surfaces
+        // explicit room counts to the resolver.
+        return adultRate * (pax.adults + pax.childAges.length);
+      }
+      return adultRate * pax.adults + childRate * childEligible;
+    };
 
-    const adultRate = row ? (row[adultKey] || 0) : (fee.flatAmount || 0);
-    // Child fees usually apply only to a specific age band (e.g. Mara 9–17).
-    // Children outside that band are free for fee purposes.
-    const childEligible = row
-      ? pax.childAges.filter(a => a >= (row.childMinAge || 0) && a <= (row.childMaxAge || 17)).length
-      : pax.childAges.length;
-    const childRate = row ? (row[childKey] || 0) : 0;
-
-    // Multiply by the unit
-    const totalPax = pax.adults + pax.childAges.length;
     let amount = 0;
     switch (fee.unit) {
       case 'per_person_per_day':
       case 'per_person_per_night':
-        amount = (adultRate * pax.adults + childRate * childEligible) * nights;
+      case 'per_room_per_night':
+        // Sum per-night — each night picks its own row.
+        for (const d of nights) amount += nightAmount(rowForNight(d));
         break;
-      case 'per_person_per_entry':
+      case 'per_person_per_entry': {
+        // One-shot at arrival, but pick the row covering the arrival date
+        // so mid-year rate changes still resolve correctly.
+        const row = rowForNight(checkIn);
+        const adultRate = row ? (row[adultKey] || 0) : (fee.flatAmount || 0);
+        const childRate = row ? (row[childKey] || 0) : 0;
+        const childEligible = row
+          ? pax.childAges.filter(a => a >= (row.childMinAge || 0) && a <= (row.childMaxAge || 17)).length
+          : pax.childAges.length;
         amount = adultRate * pax.adults + childRate * childEligible;
         break;
-      case 'per_room_per_night':
-        amount = adultRate * (pax.adults + pax.childAges.length) * nights; // approximation — adults count as rooms proxy
-        break;
+      }
       case 'flat':
-      default:
+      default: {
+        const row = rowForNight(checkIn);
+        const adultRate = row ? (row[adultKey] || 0) : (fee.flatAmount || 0);
+        const childRate = row ? (row[childKey] || 0) : 0;
+        const childEligible = row
+          ? pax.childAges.filter(a => a >= (row.childMinAge || 0) && a <= (row.childMaxAge || 17)).length
+          : pax.childAges.length;
         amount = adultRate + childRate * childEligible;
         break;
+      }
     }
 
     out.push({
@@ -473,8 +504,9 @@ export function priceStay({
     warnings.push(`FX rate ${rateList.currency}→${quoteCurrency} missing; using 1:1. Check org FX settings.`);
   }
 
-  // Pass-through fees
-  const ptFees = resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, nights.length);
+  // Pass-through fees — pass night dates so fees straddling a rate change
+  // (e.g. Jul-1 park fee jump) resolve correctly per-night.
+  const ptFees = resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, nights);
   const ptFeesConverted = ptFees.map(f => ({
     ...f,
     amountInQuoteCurrency: convert(f.amount, f.currency || rateList.currency, quoteCurrency, orgFxOverrides),

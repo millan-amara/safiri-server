@@ -353,7 +353,11 @@ Rules:
         },
         body: JSON.stringify({
           model: 'claude-sonnet-4-20250514',
-          max_tokens: 16000,
+          // 64000 is Sonnet-4's max output. Multi-hotel docs (A&K East Africa:
+          // 7 hotels × Rack+STO × LoS tiers × multi-season + pass-through fees)
+          // blow past the 16000 we started with. Ceiling, not target — we pay
+          // for actual usage only, so leaving headroom costs nothing.
+          max_tokens: 64000,
           system: systemPrompt,
           messages: [
             {
