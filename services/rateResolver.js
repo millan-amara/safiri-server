@@ -244,6 +244,32 @@ function pickRoomPricing(season, preferredRoomType) {
   return season.rooms.slice().sort((a, b) => (a.perPersonSharing || 0) - (b.perPersonSharing || 0))[0];
 }
 
+// Return a roomPricing with LoS-tier overrides applied. If the room has
+// stayTiers and a tier matches the total stay length, its non-zero values
+// replace the room-level ones. Tier values of 0 fall through, so partial
+// overrides work. When no tier matches, returns the room as-is.
+function applyStayTier(room, totalNights) {
+  if (!room?.stayTiers?.length) return room;
+  const tier = room.stayTiers.find(t => {
+    const min = t.minNights ?? 1;
+    const max = (t.maxNights == null) ? Infinity : t.maxNights;
+    return totalNights >= min && totalNights <= max;
+  });
+  if (!tier) return room;
+  const pick = (key) => {
+    const v = tier[key];
+    return (v !== undefined && v !== null && v !== 0) ? v : room[key];
+  };
+  return {
+    ...room,
+    singleOccupancy: pick('singleOccupancy'),
+    perPersonSharing: pick('perPersonSharing'),
+    triplePerPerson: pick('triplePerPerson'),
+    quadPerPerson: pick('quadPerPerson'),
+    singleSupplement: pick('singleSupplement'),
+  };
+}
+
 // ─── Supplements ───────────────────────────────────────────────────────
 // Supplements can be denominated in a different currency than the rate list
 // (Chui Lodge: KES room rates, USD Christmas/Easter supplements). We return
@@ -410,12 +436,14 @@ export function priceStay({
       continue;
     }
 
-    const roomPricing = pickRoomPricing(season, preferredRoomType);
-    if (!roomPricing) {
+    const baseRoomPricing = pickRoomPricing(season, preferredRoomType);
+    if (!baseRoomPricing) {
       warnings.push(`Season ${season.label} has no room pricing — this night skipped.`);
       nightly.push({ date, season: season.label, roomType: null, base: 0, supplements: [], total: 0 });
       continue;
     }
+    // Apply length-of-stay tier based on the total stay length (not per-night).
+    const roomPricing = applyStayTier(baseRoomPricing, nights.length);
 
     let nightBase = 0;
     const breakdown = [];

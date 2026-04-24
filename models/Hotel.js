@@ -23,6 +23,23 @@ const childBracketSchema = new mongoose.Schema({
   },
 }, { _id: false });
 
+// Length-of-stay tier. Some rate cards (A&K Sanctuary, several East-African
+// lodges) price the same room differently by total nights stayed — e.g.
+// "1–3 nights $900pp, 4–6 nights $720pp, 7+ nights $675pp". When present,
+// the resolver picks the tier matching the stay length and its prices
+// override the room-level values. Open-ended upper bound is encoded by
+// leaving maxNights null/unset. A value of 0 in a tier is treated as "not
+// set" and falls back to the room-level value, so partial overrides work.
+const stayTierSchema = new mongoose.Schema({
+  minNights: { type: Number, default: 1 },
+  maxNights: { type: Number, default: null },          // null = open-ended (7+)
+  singleOccupancy: { type: Number, default: 0 },
+  perPersonSharing: { type: Number, default: 0 },
+  triplePerPerson: { type: Number, default: 0 },
+  quadPerPerson: { type: Number, default: 0 },
+  singleSupplement: { type: Number, default: 0 },
+}, { _id: false });
+
 const roomPricingSchema = new mongoose.Schema({
   roomType: { type: String, required: true },         // "Standard", "Deluxe", "Family Suite"
   maxOccupancy: { type: Number, default: 2 },
@@ -40,6 +57,10 @@ const roomPricingSchema = new mongoose.Schema({
   quadPerPerson: { type: Number, default: 0 },        // quad: per-person OR room total depending on pricingMode
   singleSupplement: { type: Number, default: 0 },     // only meaningful in per_person mode (solo using a double)
   childBrackets: [childBracketSchema],
+  // Optional length-of-stay tiers. Leave empty when one price covers any
+  // stay length. When populated, the base fields above should hold the
+  // shortest-tier values so catalog "from" displays still work.
+  stayTiers: [stayTierSchema],
   notes: String,
 }, { _id: false });
 
@@ -95,7 +116,7 @@ const addOnSchema = new mongoose.Schema({
   description: String,
   unit: {
     type: String,
-    enum: ['per_person_per_day', 'per_day', 'per_trip', 'per_person', 'per_room_per_day'],
+    enum: ['per_person_per_day', 'per_day', 'per_trip', 'per_person', 'per_room_per_day', 'per_vehicle'],
     default: 'per_person_per_day',
   },
   amount: { type: Number, default: 0 },
