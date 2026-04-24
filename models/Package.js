@@ -43,6 +43,30 @@ const cancellationTierSchema = new mongoose.Schema({
   notes: String,
 }, { _id: false });
 
+// One pricing sheet for a package. Mirrors Hotel.rateListSchema so the same
+// audience filter + validity-window + priority logic works: a package can
+// carry Rack + STO + Resident lists on one record, and the resolver picks
+// whichever matches the quote's clientType and trip dates.
+const pricingListSchema = new mongoose.Schema({
+  name: { type: String, required: true },            // "Rack 2026", "STO 2026", "Resident 2026"
+  audience: { type: [String], default: ['retail'] }, // 'retail' | 'contract' | 'resident'
+  currency: { type: String, default: 'USD' },
+  validFrom: Date,
+  validTo: Date,
+  priority: { type: Number, default: 0 },
+  seasonLabel: { type: String, default: '' },
+  seasonDateRanges: [dateRangeSchema],
+  paxTiers: [paxTierSchema],
+  singleSupplement: { type: Number, default: 0 },
+  childBrackets: [childBracketSchema],
+  mealPlan: { type: String, default: 'FB' },
+  mealPlanLabel: { type: String, default: '' },
+  inclusions: [{ type: String }],
+  exclusions: [{ type: String }],
+  notes: { type: String, default: '' },
+  isActive: { type: Boolean, default: true },
+}, { _id: true });
+
 const packageSchema = new mongoose.Schema({
   organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', required: true },
 
@@ -61,24 +85,9 @@ const packageSchema = new mongoose.Schema({
   // The lodges/camps included (for display on the quote + for auto-populating days)
   segments: [segmentSchema],
 
-  // Pricing — single active config. Operators create another Package record
-  // for a different audience/season rather than nesting.
-  pricing: {
-    audience: { type: [String], default: ['retail'] },
-    currency: { type: String, default: 'USD' },
-    validFrom: Date,
-    validTo: Date,
-    seasonLabel: { type: String, default: '' },      // optional free-text
-    seasonDateRanges: [dateRangeSchema],              // optional — blank = any date
-    paxTiers: [paxTierSchema],
-    singleSupplement: { type: Number, default: 0 },
-    childBrackets: [childBracketSchema],
-    mealPlan: { type: String, default: 'FB' },       // packages usually include meals
-    mealPlanLabel: { type: String, default: '' },
-    inclusions: [{ type: String }],
-    exclusions: [{ type: String }],
-    notes: { type: String, default: '' },
-  },
+  // Pricing lists — one per audience/season combination. The resolver filters
+  // by audience + validity window, then picks highest priority.
+  pricingLists: [pricingListSchema],
 
   cancellationTiers: [cancellationTierSchema],
   depositPct: { type: Number, default: 30 },

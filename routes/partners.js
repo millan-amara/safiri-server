@@ -164,20 +164,67 @@ router.post('/hotels/extract-pdf',
       const systemPrompt = `You extract hotel information into structured JSON for a safari-itinerary app.
 
 The PDF can be ANY of these document types, or combinations of them:
-  (a) A rate card with pricing tables (Chui, AA Lodges, Acacia).
+  (a) A hotel rate card with nightly pricing tables (Chui, AA Lodges, Acacia).
   (b) A Terms & Conditions document with cancellation, deposit, payment policies.
-  (c) A property info / fact sheet with description, amenities, bedroom count, nearest airport.
-  (d) A multi-hotel chain document with several properties (AA Lodges Masai Mara + Amboseli).
-  (e) A bundle — rate tables + T&Cs + info all on the same pages.
+  (c) A property info / fact sheet with description, amenities, bedroom count.
+  (d) A multi-hotel chain document with several properties on one sheet.
+  (e) A PACKAGE / TRAIL rate card — multi-camp mobile safaris priced as a whole trip (not per night) with pax tiers (1 pax / 2 pax / 3+ pax per person). Maasai Trails is the canonical example: named trails like "Through the Rift", "Great Rift Valley Walk", "Oltyiani Trail" that visit a sequence of camps over several nights.
+  (f) A bundle combining any of the above.
 
-Extract WHATEVER is present. Do NOT fail or return empty if rate tables are missing — an info sheet with only description and amenities is still valid input. Fields you cannot populate should be omitted from the output (not set to empty strings or zero).
+Extract WHATEVER is present. Do NOT fail or return empty if rate tables are missing. Fields you cannot populate should be omitted (not set to empty strings or zero).
 
-ALWAYS return an array of hotels in the "hotels" field, even if only one is present. Shared Terms & Policies (cancellation, deposit, booking terms, child policy, inclusions) apply to every hotel in the document — duplicate the same values across each hotel's rateLists if rate lists exist. If there are no rate lists, still capture the T&Cs but leave rateLists as an empty array.
+Return two top-level arrays: "hotels" for nightly-priced lodges, "packages" for trip-priced multi-camp trails. Either can be empty. Shared Terms & Policies apply to every record in the document — duplicate them across each.
+
+HOTEL vs PACKAGE decision rule:
+  - If the document prices per night / per person per night / per room per night → HOTEL.
+  - If the document prices per whole trip / per person for a named trail of N nights → PACKAGE.
+  - If a "2-night extension" or similar ambiguous product appears alongside packages, treat as a package with durationNights=2.
 
 You MUST respond with ONLY valid JSON — no markdown, no commentary. The top-level shape is:
 {
-  "hotels": [HotelObject, HotelObject, ...],
-  "warnings": ["array of strings flagging ambiguities — e.g. 'Could not parse Easter supplement dates'"]
+  "hotels": [HotelObject, ...],
+  "packages": [PackageObject, ...],
+  "warnings": ["array of strings flagging ambiguities"]
+}
+
+PackageObject schema:
+{
+  "name": "Through the Rift",
+  "destination": "Loita Hills" | "Kenya + Tanzania" | ...,
+  "description": "3-night walking safari through Rift Valley camps",
+  "durationNights": 3,
+  "durationDays": 4,
+  "segments": [
+    { "startDay": 1, "endDay": 1, "location": "River Camp", "hotelName": "River Camp" },
+    { "startDay": 2, "endDay": 2, "location": "Oltyiani", "hotelName": "Oltyiani" },
+    { "startDay": 3, "endDay": 3, "location": "Ngurumans", "hotelName": "Ngurumans" }
+  ],
+  "pricingLists": [
+    {
+      "name": "Rack 2026",
+      "audience": ["retail"],
+      "currency": "USD",
+      "validFrom": "2026-01-01",
+      "validTo": "2026-12-31",
+      "priority": 0,
+      "paxTiers": [
+        { "minPax": 1, "maxPax": 1, "pricePerPerson": 2935 },
+        { "minPax": 2, "maxPax": 2, "pricePerPerson": 2602 },
+        { "minPax": 3, "maxPax": 99, "pricePerPerson": 1947 }
+      ],
+      "singleSupplement": 0,
+      "childBrackets": [
+        { "label": "under 16", "minAge": 0, "maxAge": 15, "mode": "pct", "value": 75, "sharingRule": "any" }
+      ],
+      "mealPlan": "FB",
+      "mealPlanLabel": "Full Board",
+      "inclusions": ["Full board accommodation", "All drinks except premium", "All safari equipment", "Guides and staff"],
+      "exclusions": ["Emergency evacuation cover", "Flights", "Vehicle transfers", "Gratuities"]
+    }
+  ],
+  "cancellationTiers": [{ "daysBefore": 60, "penaltyPct": 25 }],
+  "depositPct": 30,
+  "bookingTerms": "..."
 }
 
 Each HotelObject follows this schema:
@@ -276,7 +323,8 @@ Rules:
 - All monetary values as bare numbers (no currency symbols, no commas).
 - All dates as YYYY-MM-DD.
 - MULTI-HOTEL DOCUMENTS: if the PDF has separate sections or tables for different properties (AA Lodge Masai Mara and AA Lodge Amboseli, Serena properties, etc.), return one HotelObject per property in the top-level "hotels" array. Shared Terms & Policies (cancellation, deposit, booking terms, inclusions) apply to all properties — copy them into each hotel's rateLists.
-- INFO / FACT SHEETS without rate tables: when the PDF is a property description (e.g. a "Key Info" sheet with bedrooms, amenities, nearest-beach distance), extract "name", "destination", "location", "type", "description" (the marketing prose), and "amenities" (flatten every feature from Pool, General, Standard, Utilities, Outdoors, Access tables into a single amenities string array — skip trivia like furniture counts, wheelchair suitability, pet/smoking rules which don't belong on a client quote). Leave "rateLists" as an empty array. DO NOT invent rates.`;
+- INFO / FACT SHEETS without rate tables: when the PDF is a property description (e.g. a "Key Info" sheet with bedrooms, amenities, nearest-beach distance), extract "name", "destination", "location", "type", "description" (the marketing prose), and "amenities" (flatten every feature from Pool, General, Standard, Utilities, Outdoors, Access tables into a single amenities string array — skip trivia like furniture counts, wheelchair suitability, pet/smoking rules which don't belong on a client quote). Leave "rateLists" as an empty array. DO NOT invent rates.
+- PACKAGE TRAIL EXTRACTION: when the PDF lists named multi-camp trails with whole-trip pricing (Maasai Trails, some Wilderness / Asilia walking safaris), emit one PackageObject per trail. Parse the camp sequence into segments (one per camp stay); pax-tier pricing tables into paxTiers; child policy ("Children under 16 pay 75%") into childBrackets; "Rack" vs "STO" vs "Resident" into separate pricingLists entries with the matching audience tag. Full-trip flat-price products ("Extension from the Mara: US$ 665 pp/day") also belong in packages — convert the per-day number into a single paxTier using (durationDays × rate) as pricePerPerson, OR leave pricing as a single tier with a note explaining the per-day structure.`;
 
       const userText = [
         'Extract the hotel rate card from this PDF into the JSON schema above.',
@@ -347,15 +395,17 @@ Rules:
         });
       }
 
-      // Normalize to the hotels[] shape. If Claude returned a single HotelObject
-      // (legacy shape), wrap it; if it returned the new { hotels: [...] } shape,
-      // pass through. Warnings live at the top level either way.
+      // Normalize. Claude may return:
+      //   { hotels: [...], packages: [...], warnings: [...] }  (current schema)
+      //   { hotels: [...], warnings: [...] }                   (earlier schema)
+      //   { ...singleHotel }                                   (legacy, rate-card PDFs)
       const hotels = Array.isArray(parsed?.hotels)
         ? parsed.hotels
-        : (parsed && typeof parsed === 'object' ? [parsed] : []);
+        : (parsed && typeof parsed === 'object' && !parsed.packages ? [parsed] : []);
+      const packages = Array.isArray(parsed?.packages) ? parsed.packages : [];
       const warnings = Array.isArray(parsed?.warnings) ? parsed.warnings : [];
 
-      res.json({ drafts: hotels, warnings });
+      res.json({ drafts: hotels, packages, warnings });
     } catch (error) {
       console.error('PDF extract error:', error);
       res.status(500).json({ message: error.message });
@@ -532,28 +582,151 @@ router.delete('/packages/:id', protect, async (req, res) => {
   }
 });
 
+// Merge new pricing lists into an existing package. Used by the PDF extraction
+// flow when the operator uploads a second rate sheet (e.g. STO after Rack) for
+// a package that already exists — we append only pricing lists whose `name`
+// isn't already present, avoiding duplicates.
+// Also fills cancellationTiers / bookingTerms / depositPct if the existing
+// record has none (never clobbers operator-entered values).
+// Same merge semantics for hotels: append rate lists by name, fill shared
+// contract/policy fields only where the existing record is blank.
+router.put('/hotels/:id/merge-rate-lists', protect, async (req, res) => {
+  try {
+    const hotel = await Hotel.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!hotel) return res.status(404).json({ message: 'Not found' });
+
+    const {
+      rateLists = [],
+      description = '',
+      amenities = [],
+    } = req.body;
+
+    const existingListNames = new Set((hotel.rateLists || []).map(l => l.name));
+    const appended = [];
+    for (const list of rateLists) {
+      if (!list?.name || existingListNames.has(list.name)) continue;
+      hotel.rateLists.push(list);
+      existingListNames.add(list.name);
+      appended.push(list.name);
+    }
+
+    if (!hotel.description && description) hotel.description = description;
+    if ((!hotel.amenities?.length) && amenities.length) {
+      hotel.amenities = amenities;
+    } else if (amenities.length) {
+      // Union dedup
+      hotel.amenities = Array.from(new Set([...hotel.amenities, ...amenities]));
+    }
+
+    await hotel.save();
+    res.json({ hotel, appendedListNames: appended });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+router.put('/packages/:id/merge-pricing-lists', protect, async (req, res) => {
+  try {
+    const pkg = await Package.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!pkg) return res.status(404).json({ message: 'Not found' });
+
+    const {
+      pricingLists = [],
+      cancellationTiers = [],
+      bookingTerms = '',
+      depositPct = 0,
+      description = '',
+    } = req.body;
+
+    const existingListNames = new Set((pkg.pricingLists || []).map(l => l.name));
+    const appended = [];
+    for (const list of pricingLists) {
+      if (!list?.name || existingListNames.has(list.name)) continue;
+      pkg.pricingLists.push(list);
+      existingListNames.add(list.name);
+      appended.push(list.name);
+    }
+
+    // Only fill shared fields if the existing record leaves them blank.
+    if (!pkg.cancellationTiers?.length && cancellationTiers.length) {
+      pkg.cancellationTiers = cancellationTiers;
+    }
+    if (!pkg.bookingTerms && bookingTerms) pkg.bookingTerms = bookingTerms;
+    if (!pkg.depositPct && depositPct) pkg.depositPct = depositPct;
+    if (!pkg.description && description) pkg.description = description;
+
+    await pkg.save();
+    res.json({ package: pkg, appendedListNames: appended });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Price a package for a given party. Picks the matching pax tier, applies
 // child brackets + single supplement, returns a breakdown in both source
 // and quote currency. Unlike hotels, a package is priced once per trip
 // (not per night), so this returns a trip-level total.
+// Canonical audience tag expansions — same mapping the hotel resolver uses.
+const PACKAGE_AUDIENCE_MATCH = {
+  retail: ['retail', 'public', 'rack'],
+  contract: ['contract', 'dmc', 'agent', 'sto', 'trade'],
+  resident: ['resident', 'eac', 'citizen', 'local'],
+};
+
+function packageListMatchesAudience(list, clientType) {
+  const accept = PACKAGE_AUDIENCE_MATCH[clientType] || [clientType];
+  return (list.audience || []).some(tag => accept.includes(String(tag).toLowerCase()));
+}
+
+function packageListCoversDate(list, date) {
+  const from = list.validFrom ? new Date(list.validFrom) : null;
+  const to = list.validTo ? new Date(list.validTo) : null;
+  const d = date ? new Date(date) : new Date();
+  if (from && d < from) return false;
+  if (to && d > to) return false;
+  return true;
+}
+
 router.post('/packages/:id/price', protect, async (req, res) => {
   try {
     const pkg = await Package.findOne({ _id: req.params.id, organization: req.organizationId }).lean();
     if (!pkg) return res.status(404).json({ message: 'Not found' });
 
-    const { adults = 2, childAges = [], quoteCurrency, clientType } = req.body;
-    const { convert } = await import('../utils/fx.js');
+    const {
+      adults = 2,
+      childAges = [],
+      quoteCurrency,
+      clientType = 'retail',
+      startDate,
+    } = req.body;
+    const { convert, getFxRate } = await import('../utils/fx.js');
 
     const effectiveCurrency = quoteCurrency || req.organization?.defaults?.currency || 'USD';
     const orgFxOverrides = req.organization?.fxRates || {};
-
-    const pricing = pkg.pricing || {};
-    // Audience check — warn but don't block.
     const warnings = [];
-    if (clientType && pricing.audience?.length && !pricing.audience.includes(clientType)) {
-      warnings.push(`Package pricing is for audience=${pricing.audience.join('/')}; selected clientType=${clientType}`);
+
+    // ─── Pick the pricing list ─────────────────────────────────────────────
+    const allLists = (pkg.pricingLists || []).filter(l => l.isActive !== false);
+    if (allLists.length === 0) {
+      return res.json({ ok: false, reason: 'no_pricing_lists', warnings });
     }
 
+    let eligible = allLists.filter(l => packageListMatchesAudience(l, clientType));
+    if (!eligible.length) {
+      warnings.push(`No pricing list matches clientType=${clientType}. Falling back to any active list.`);
+      eligible = allLists;
+    }
+
+    const dated = eligible.filter(l => packageListCoversDate(l, startDate));
+    if (dated.length) eligible = dated;
+    else if (startDate) warnings.push(`No pricing list covers start date ${startDate}. Using most recent.`);
+
+    const pricing = eligible.slice().sort((a, b) => (b.priority || 0) - (a.priority || 0))[0];
+    if (!pricing) {
+      return res.json({ ok: false, reason: 'no_eligible_pricing_list', warnings });
+    }
+
+    // ─── Pax tier + child breakdown ────────────────────────────────────────
     const totalPax = Number(adults) + (childAges?.length || 0);
     const tier = (pricing.paxTiers || []).find(t => totalPax >= (t.minPax || 1) && totalPax <= (t.maxPax || 99));
     if (!tier) {
@@ -578,11 +751,12 @@ router.post('/packages/:id/price', protect, async (req, res) => {
     }
 
     const subtotalSource = adultTotal + singleSupplement + childTotal;
-    const fxRate = (await import('../utils/fx.js')).getFxRate(pricing.currency, effectiveCurrency, orgFxOverrides) ?? 1;
+    const fxRate = getFxRate(pricing.currency, effectiveCurrency, orgFxOverrides) ?? 1;
 
     res.json({
       ok: true,
       package: { _id: pkg._id, name: pkg.name, durationNights: pkg.durationNights, durationDays: pkg.durationDays },
+      pricingList: { _id: pricing._id, name: pricing.name, audience: pricing.audience, priority: pricing.priority, mealPlan: pricing.mealPlan },
       tier,
       adults,
       childAges,
