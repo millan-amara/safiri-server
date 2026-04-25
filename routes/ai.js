@@ -4,6 +4,7 @@ import { protect } from '../middleware/auth.js';
 import { checkAiCredits } from '../middleware/subscription.js';
 import { logAiCall } from '../utils/aiLogger.js';
 import { AI_CREDIT_COST, getPlan } from '../config/plans.js';
+import { Deal } from '../models/Deal.js';
 
 const heavy  = checkAiCredits(AI_CREDIT_COST.heavy);
 const medium = checkAiCredits(AI_CREDIT_COST.medium);
@@ -600,6 +601,71 @@ Generate the full itinerary as JSON.`;
     });
   } catch (error) {
     console.error('Draft itinerary error:', error.message);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ─── DRAFT SCHEDULED PRE-TRIP MESSAGE ────────────────
+// Used by the deal-detail "Scheduled messages" panel. Returns a ready-to-edit
+// subject + body the operator can tweak before scheduling. Medium credit cost.
+
+router.post('/draft-scheduled-message', medium, logAiCall('draft-scheduled-message'), async (req, res) => {
+  try {
+    const { dealId, kind = 'general', notes = '' } = req.body;
+    if (!dealId) return res.status(400).json({ message: 'dealId is required' });
+
+    const deal = await Deal.findOne({ _id: dealId, organization: req.organizationId })
+      .populate('contact', 'firstName lastName')
+      .lean();
+    if (!deal) return res.status(404).json({ message: 'Deal not found' });
+
+    const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'TBD';
+
+    const dealContext = `
+- Client: ${deal.contact?.firstName || 'the client'} ${deal.contact?.lastName || ''}
+- Trip: ${deal.title}
+- Destination: ${deal.destination || 'unspecified'}
+- Travel dates: ${fmtDate(deal.travelDates?.start)} to ${fmtDate(deal.travelDates?.end)}
+- Group: ${deal.groupSize || 'unknown'} travelers
+- Trip type: ${deal.tripType || 'unspecified'}
+- Interests: ${(deal.interests || []).join(', ') || 'none specified'}
+- Special requests: ${deal.specialRequests || 'none'}
+`.trim();
+
+    const kindHints = {
+      general: 'A general pre-trip touch-base message — friendly check-in.',
+      packing: 'Packing tips and what to bring for this destination and travel style.',
+      pickup: 'Confirming pickup arrangements and final logistics, sent 2-3 days before departure.',
+      review: 'A polite request for a review or feedback after their return.',
+      followup: 'A general post-trip follow-up checking in on how the trip went.',
+      welcome: 'A welcome message right after booking, setting expectations and next steps.',
+    };
+
+    const system = `You are a tour operator drafting a friendly, professional message to a client. Keep it warm, personal, and specific to their trip — not marketing speak. Use the client's first name. Be concise (under 200 words). Vary your openings; don't start every message with "Dear".
+
+The body supports light Markdown: **bold** for emphasis, *italic* for subtler emphasis, "- " bullets for short lists, [link text](url) for links. Paragraph breaks are blank lines. Use formatting sparingly — a couple of bolds or a single bullet list at most. Don't add headings.
+
+Output format (strict):
+SUBJECT: <one-line subject>
+BODY:
+<message body in light Markdown, with paragraph breaks>`;
+
+    const prompt = `Draft a pre-trip message of this type: ${kindHints[kind] || kindHints.general}
+
+${notes ? `Operator's note for this specific message: ${notes}\n\n` : ''}Trip details:
+${dealContext}`;
+
+    const response = await callClaude(system, prompt, 600);
+
+    // Parse the response into subject + body. Be lenient — if the model didn't
+    // follow the format we still want to surface something usable.
+    const subjectMatch = response.match(/^SUBJECT:\s*(.+)$/im);
+    const bodyMatch = response.match(/BODY:\s*([\s\S]+)$/i);
+    const subject = subjectMatch?.[1]?.trim() || '';
+    const body = (bodyMatch?.[1] || response).trim();
+
+    res.json({ subject, body });
+  } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });

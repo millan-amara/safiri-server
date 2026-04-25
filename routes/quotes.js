@@ -2,12 +2,42 @@ import { Router } from 'express';
 import Quote from '../models/Quote.js';
 import Organization from '../models/Organization.js';
 import Hotel from '../models/Hotel.js';
-import { protect } from '../middleware/auth.js';
+import { Deal, Pipeline } from '../models/Deal.js';
+import { protect, authorize } from '../middleware/auth.js';
+import { getAccessiblePipelineIds, userCanSeePipeline } from '../middleware/access.js';
 import { requireQuoteQuota, trackQuoteUsage } from '../middleware/subscription.js';
 import { createNotification } from './notifications.js';
 import { triggerAutomation } from '../automations/engine.js';
 
 const router = Router();
+
+const ADMIN_ROLES = ['owner', 'admin'];
+const isAdmin = (user) => ADMIN_ROLES.includes(user.role);
+
+// True if the user can read/write a quote based on its (optional) deal link.
+// Quotes with no deal are org-wide accessible.
+async function canAccessQuoteDeal(user, quote) {
+  if (!quote?.deal) return true;
+  if (isAdmin(user)) return true;
+  const deal = await Deal.findOne({ _id: quote.deal, organization: user.organization })
+    .select('pipeline').lean();
+  if (!deal) return true;
+  const pipeline = await Pipeline.findOne({ _id: deal.pipeline, organization: user.organization }).lean();
+  if (!pipeline) return true;
+  return userCanSeePipeline(user, pipeline);
+}
+
+// True if the user can link a *new* quote to the given deal id.
+async function canLinkToDeal(user, dealId) {
+  if (!dealId) return true;
+  if (isAdmin(user)) return true;
+  const deal = await Deal.findOne({ _id: dealId, organization: user.organization })
+    .select('pipeline').lean();
+  if (!deal) return false;
+  const pipeline = await Pipeline.findOne({ _id: deal.pipeline, organization: user.organization }).lean();
+  if (!pipeline) return false;
+  return userCanSeePipeline(user, pipeline);
+}
 
 // Fill in hotel images on days where the snapshot is missing them
 async function hydrateHotelImages(quote) {
@@ -39,6 +69,23 @@ router.get('/', protect, async (req, res) => {
     if (status) filter.status = status;
     if (deal) filter.deal = deal;
 
+    // Non-admins only see quotes whose linked deal is in their accessible pipelines
+    // (or quotes with no deal link at all — those are org-wide visible).
+    if (!isAdmin(req.user)) {
+      const accessiblePipelines = await getAccessiblePipelineIds(req.user);
+      const accessibleDeals = await Deal.find({
+        organization: req.organizationId,
+        pipeline: { $in: accessiblePipelines },
+        isActive: true,
+      }).select('_id').lean();
+      const accessibleDealIds = accessibleDeals.map(d => d._id);
+      filter.$or = [
+        { deal: { $in: accessibleDealIds } },
+        { deal: null },
+        { deal: { $exists: false } },
+      ];
+    }
+
     const quotes = await Quote.find(filter)
       .populate('contact', 'firstName lastName email')
       .populate('deal', 'title')
@@ -62,6 +109,9 @@ router.get('/:id', protect, async (req, res) => {
       .populate('deal', 'title')
       .populate('createdBy', 'name');
     if (!quote) return res.status(404).json({ message: 'Quote not found' });
+    if (!(await canAccessQuoteDeal(req.user, quote))) {
+      return res.status(403).json({ message: 'No access to this quote' });
+    }
     res.json(quote);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -82,8 +132,11 @@ function sanitizeDays(days) {
 }
 
 // Create quote
-router.post('/', protect, requireQuoteQuota, async (req, res) => {
+router.post('/', protect, authorize('owner', 'admin', 'agent'), requireQuoteQuota, async (req, res) => {
   try {
+    if (req.body.deal && !(await canLinkToDeal(req.user, req.body.deal))) {
+      return res.status(403).json({ message: 'No access to the linked deal' });
+    }
     // Snapshot branding at creation time (need full doc for branding fields)
     const org = await Organization.findById(req.organizationId);
     const brandingSnapshot = {
@@ -136,7 +189,7 @@ router.post('/', protect, requireQuoteQuota, async (req, res) => {
 });
 
 // Update quote
-router.put('/:id', protect, async (req, res) => {
+router.put('/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const body = { ...req.body };
     if (body.days) body.days = sanitizeDays(body.days);
@@ -144,6 +197,14 @@ router.put('/:id', protect, async (req, res) => {
     if (body.deal === '' || body.deal === null) body.deal = undefined;
 
     const prior = await Quote.findOne({ _id: req.params.id, organization: req.organizationId }).select('status deal contact').lean();
+    if (!prior) return res.status(404).json({ message: 'Not found' });
+    if (!(await canAccessQuoteDeal(req.user, prior))) {
+      return res.status(403).json({ message: 'No access to this quote' });
+    }
+    // If user is moving the quote to a different deal, they must also have access to the target.
+    if (body.deal && String(body.deal) !== String(prior.deal || '') && !(await canLinkToDeal(req.user, body.deal))) {
+      return res.status(403).json({ message: 'No access to the target deal' });
+    }
     const quote = await Quote.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
       body,
@@ -167,10 +228,13 @@ router.put('/:id', protect, async (req, res) => {
 });
 
 // Create new version of a quote
-router.post('/:id/version', protect, async (req, res) => {
+router.post('/:id/version', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const original = await Quote.findOne({ _id: req.params.id, organization: req.organizationId });
     if (!original) return res.status(404).json({ message: 'Quote not found' });
+    if (!(await canAccessQuoteDeal(req.user, original))) {
+      return res.status(403).json({ message: 'No access to this quote' });
+    }
 
     // Clone the quote
     const cloneData = original.toObject();
@@ -219,13 +283,16 @@ router.get('/:id/versions', protect, async (req, res) => {
 });
 
 // Save quote as template
-router.post('/:id/save-as-template', protect, async (req, res) => {
+router.post('/:id/save-as-template', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const { templateName, templateDescription } = req.body;
     if (!templateName?.trim()) return res.status(400).json({ message: 'Template name required' });
 
     const original = await Quote.findOne({ _id: req.params.id, organization: req.organizationId });
     if (!original) return res.status(404).json({ message: 'Quote not found' });
+    if (!(await canAccessQuoteDeal(req.user, original))) {
+      return res.status(403).json({ message: 'No access to this quote' });
+    }
 
     const cloneData = original.toObject();
     delete cloneData._id;
@@ -261,10 +328,13 @@ router.post('/:id/save-as-template', protect, async (req, res) => {
 });
 
 // Duplicate template into a new quote
-router.post('/templates/:id/use', protect, requireQuoteQuota, async (req, res) => {
+router.post('/templates/:id/use', protect, authorize('owner', 'admin', 'agent'), requireQuoteQuota, async (req, res) => {
   try {
     const template = await Quote.findOne({ _id: req.params.id, organization: req.organizationId, isTemplate: true });
     if (!template) return res.status(404).json({ message: 'Template not found' });
+    if (req.body.dealId && !(await canLinkToDeal(req.user, req.body.dealId))) {
+      return res.status(403).json({ message: 'No access to the target deal' });
+    }
 
     const cloneData = template.toObject();
     delete cloneData._id;
@@ -299,9 +369,14 @@ router.post('/templates/:id/use', protect, requireQuoteQuota, async (req, res) =
 });
 
 // Delete quote
-router.delete('/:id', protect, async (req, res) => {
+router.delete('/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
-    await Quote.findOneAndDelete({ _id: req.params.id, organization: req.organizationId });
+    const quote = await Quote.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!quote) return res.status(404).json({ message: 'Not found' });
+    if (!(await canAccessQuoteDeal(req.user, quote))) {
+      return res.status(403).json({ message: 'No access to this quote' });
+    }
+    await Quote.findByIdAndDelete(quote._id);
     res.json({ message: 'Deleted' });
   } catch (error) {
     res.status(500).json({ message: error.message });

@@ -8,7 +8,15 @@ const pipelineSchema = new mongoose.Schema({
     name: { type: String, required: true },
     order: { type: Number, required: true },
     color: { type: String, default: '#6B7280' },
+    // Semantic role of this stage. Drives won/lost detection across custom-named
+    // pipelines (e.g. Marketing's "Handed to Sales" is a 'won' even though the
+    // name isn't "Won"). Kept distinct from `name` so operators can rename freely.
+    type: { type: String, enum: ['open', 'won', 'lost'], default: 'open' },
   }],
+  // Access control. 'organization' = every member of the org sees this pipeline.
+  // 'members' = only owner/admin + users listed in `members` see it.
+  visibility: { type: String, enum: ['organization', 'members'], default: 'organization' },
+  members: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   isDefault: { type: Boolean, default: false },
   isActive: { type: Boolean, default: true },
 }, { timestamps: true });

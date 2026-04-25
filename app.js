@@ -20,8 +20,15 @@ import webhookRoutes from './routes/webhooks.js';
 import cronRoutes from './routes/cron.js';
 import billingRoutes from './routes/billing.js';
 import libraryRoutes from './routes/library.js';
+import onboardingRoutes from './routes/onboarding.js';
+import scheduledMessagesRoutes from './routes/scheduledMessages.js';
+import savedViewsRoutes from './routes/savedViews.js';
+import invoicesRoutes from './routes/invoices.js';
+import webhookDeliveriesRoutes from './routes/webhookDeliveries.js';
 import { checkInactiveDeals, checkOverdueTasks } from './automations/engine.js';
 import { startReminderPoller } from './queues/reminderPoller.js';
+import { startScheduledMessagePoller } from './queues/scheduledMessagePoller.js';
+import { startWebhookRetryPoller } from './queues/webhookRetryPoller.js';
 
 dotenv.config();
 
@@ -72,6 +79,11 @@ app.use('/api/webhooks', webhookRoutes);
 app.use('/api/cron', cronRoutes);
 app.use('/api/billing', billingRoutes);
 app.use('/api/library', libraryRoutes);
+app.use('/api/onboarding', onboardingRoutes);
+app.use('/api/scheduled-messages', scheduledMessagesRoutes);
+app.use('/api/saved-views', savedViewsRoutes);
+app.use('/api/invoices', invoicesRoutes);
+app.use('/api/webhook-deliveries', webhookDeliveriesRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
@@ -125,6 +137,120 @@ const start = async () => {
     // Not critical
   }
 
+  // ── CRM access-control backfill (idempotent) ─────────────────────────────────
+  // Adds visibility/members defaults to existing pipelines and preferences
+  // defaults to existing organizations. Safe to run on every boot.
+  try {
+    const Org = (await import('./models/Organization.js')).default;
+    const { Pipeline } = await import('./models/Deal.js');
+
+    const pipResult = await Pipeline.updateMany(
+      { visibility: { $exists: false } },
+      { $set: { visibility: 'organization', members: [] } }
+    );
+    if (pipResult.modifiedCount > 0) {
+      console.log(`Backfilled access fields on ${pipResult.modifiedCount} pipelines`);
+    }
+
+    const orgResult = await Org.updateMany(
+      { 'preferences.dealHandoffMode': { $exists: false } },
+      { $set: { 'preferences.dealHandoffMode': 'convert', 'preferences.agentDealDeletion': 'own' } }
+    );
+    if (orgResult.modifiedCount > 0) {
+      console.log(`Backfilled preferences on ${orgResult.modifiedCount} organizations`);
+    }
+
+    const reassignResult = await Org.updateMany(
+      { 'preferences.agentDealReassign': { $exists: false } },
+      { $set: { 'preferences.agentDealReassign': 'own' } }
+    );
+    if (reassignResult.modifiedCount > 0) {
+      console.log(`Backfilled agentDealReassign on ${reassignResult.modifiedCount} organizations`);
+    }
+
+    const sendTimeResult = await Org.updateMany(
+      { 'preferences.scheduledMessageHour': { $exists: false } },
+      { $set: {
+        'preferences.scheduledMessageHour': 9,
+        'preferences.scheduledMessageTimezone': 'Africa/Nairobi',
+      } }
+    );
+    if (sendTimeResult.modifiedCount > 0) {
+      console.log(`Backfilled scheduledMessage time defaults on ${sendTimeResult.modifiedCount} organizations`);
+    }
+
+    const invoicePrefsResult = await Org.updateMany(
+      { 'preferences.autoGenerateInvoiceOnWon': { $exists: false } },
+      { $set: {
+        'preferences.autoGenerateInvoiceOnWon': true,
+        'preferences.defaultTaxPercent': 0,
+        'preferences.paymentInstructions': '',
+      } }
+    );
+    if (invoicePrefsResult.modifiedCount > 0) {
+      console.log(`Backfilled invoice preferences on ${invoicePrefsResult.modifiedCount} organizations`);
+    }
+
+    const webhookPrefsResult = await Org.updateMany(
+      { 'preferences.accountingWebhookUrl': { $exists: false } },
+      { $set: {
+        'preferences.accountingWebhookUrl': '',
+        'preferences.accountingWebhookSecret': '',
+      } }
+    );
+    if (webhookPrefsResult.modifiedCount > 0) {
+      console.log(`Backfilled accounting webhook prefs on ${webhookPrefsResult.modifiedCount} organizations`);
+    }
+
+    // Backfill stage.type — assign 'won'/'lost' to known terminal names so
+    // existing pipelines work with type-based won/lost detection.
+    // Recognized: Won, Closed Won, Booked → won; Lost, Closed Lost, Disqualified → lost;
+    // Handed to Sales → won (Marketing pipeline pattern).
+    const wonNames = ['Won', 'Closed Won', 'Booked', 'Handed to Sales'];
+    const lostNames = ['Lost', 'Closed Lost', 'Disqualified'];
+
+    const allPipelines = await Pipeline.find({}).select('stages').lean();
+    let stageBackfillCount = 0;
+    for (const p of allPipelines) {
+      const stages = p.stages || [];
+      let dirty = false;
+      const updated = stages.map(s => {
+        if (s.type) return s;
+        dirty = true;
+        let type = 'open';
+        if (wonNames.includes(s.name)) type = 'won';
+        else if (lostNames.includes(s.name)) type = 'lost';
+        return { ...s, type };
+      });
+      if (dirty) {
+        await Pipeline.updateOne({ _id: p._id }, { $set: { stages: updated } });
+        stageBackfillCount++;
+      }
+    }
+    if (stageBackfillCount > 0) {
+      console.log(`Backfilled stage.type on ${stageBackfillCount} pipelines`);
+    }
+
+    // Backfill TTL expireAt on already-terminal webhook deliveries so they
+    // age out via the new TTL index instead of accumulating indefinitely.
+    const WebhookDelivery = (await import('./models/WebhookDelivery.js')).default;
+    const succExpiry = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+    const failExpiry = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000);
+    const succBackfill = await WebhookDelivery.updateMany(
+      { status: 'succeeded', expireAt: { $in: [null, undefined] } },
+      { $set: { expireAt: succExpiry } }
+    );
+    const failBackfill = await WebhookDelivery.updateMany(
+      { status: 'failed', expireAt: { $in: [null, undefined] } },
+      { $set: { expireAt: failExpiry } }
+    );
+    if (succBackfill.modifiedCount + failBackfill.modifiedCount > 0) {
+      console.log(`Backfilled TTL expireAt on ${succBackfill.modifiedCount} succeeded + ${failBackfill.modifiedCount} failed deliveries`);
+    }
+  } catch (e) {
+    console.error('CRM access backfill failed:', e.message);
+  }
+
 
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
@@ -135,6 +261,12 @@ const start = async () => {
 
     // Task reminder poller — MongoDB-backed, 60s interval
     startReminderPoller();
+
+    // Scheduled-message poller — pre-trip / lifecycle messages, 60s interval
+    startScheduledMessagePoller();
+
+    // Webhook retry poller — re-attempts pending invoice webhooks per backoff
+    startWebhookRetryPoller();
   });
 };
 

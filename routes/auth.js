@@ -10,6 +10,38 @@ import { PLANS, nextMonthlyResetDate } from '../config/plans.js';
 
 const router = Router();
 
+// Seed the starter pipelines for a brand-new org.
+// Two pipelines so cross-team workflow (marketing → sales) is visible from day one.
+async function seedStarterPipelines(organizationId) {
+  await Pipeline.create([
+    {
+      organization: organizationId,
+      name: 'Sales Pipeline',
+      isDefault: true,
+      stages: [
+        { name: 'New Inquiry', order: 0, color: '#6B7280', type: 'open' },
+        { name: 'Qualified', order: 1, color: '#3B82F6', type: 'open' },
+        { name: 'Proposal Sent', order: 2, color: '#F59E0B', type: 'open' },
+        { name: 'Negotiation', order: 3, color: '#8B5CF6', type: 'open' },
+        { name: 'Won', order: 4, color: '#10B981', type: 'won' },
+        { name: 'Lost', order: 5, color: '#EF4444', type: 'lost' },
+      ],
+    },
+    {
+      organization: organizationId,
+      name: 'Marketing Pipeline',
+      isDefault: false,
+      stages: [
+        { name: 'New Lead', order: 0, color: '#6B7280', type: 'open' },
+        { name: 'Nurturing', order: 1, color: '#3B82F6', type: 'open' },
+        { name: 'Qualified', order: 2, color: '#F59E0B', type: 'open' },
+        { name: 'Handed to Sales', order: 3, color: '#10B981', type: 'won' },
+        { name: 'Disqualified', order: 4, color: '#EF4444', type: 'lost' },
+      ],
+    },
+  ]);
+}
+
 // Register new org + owner
 router.post('/register', async (req, res) => {
   try {
@@ -68,20 +100,8 @@ router.post('/register', async (req, res) => {
     org.owner = user._id;
     await org.save();
 
-    // Create default pipeline
-    await Pipeline.create({
-      organization: org._id,
-      name: 'Sales Pipeline',
-      isDefault: true,
-      stages: [
-        { name: 'New Inquiry', order: 0, color: '#6B7280' },
-        { name: 'Qualified', order: 1, color: '#3B82F6' },
-        { name: 'Proposal Sent', order: 2, color: '#F59E0B' },
-        { name: 'Negotiation', order: 3, color: '#8B5CF6' },
-        { name: 'Won', order: 4, color: '#10B981' },
-        { name: 'Lost', order: 5, color: '#EF4444' },
-      ],
-    });
+    // Seed starter pipelines (Sales + Marketing) so the multi-pipeline value is visible day one.
+    await seedStarterPipelines(org._id);
 
     // Send verification email
     const verifyToken = crypto.randomBytes(32).toString('hex');
@@ -413,20 +433,7 @@ router.get('/google/callback', async (req, res) => {
         org.owner = user._id;
         await org.save();
 
-        // Create default pipeline
-        await Pipeline.create({
-          organization: org._id,
-          name: 'Sales Pipeline',
-          isDefault: true,
-          stages: [
-            { name: 'New Inquiry', order: 0, color: '#6B7280' },
-            { name: 'Qualified', order: 1, color: '#3B82F6' },
-            { name: 'Proposal Sent', order: 2, color: '#F59E0B' },
-            { name: 'Negotiation', order: 3, color: '#8B5CF6' },
-            { name: 'Won', order: 4, color: '#10B981' },
-            { name: 'Lost', order: 5, color: '#EF4444' },
-          ],
-        });
+        await seedStarterPipelines(org._id);
       }
     }
 

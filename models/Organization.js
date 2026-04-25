@@ -41,6 +41,43 @@ const organizationSchema = new mongoose.Schema({
   // Empty object = use server defaults in utils/fx.js.
   fxRates: { type: mongoose.Schema.Types.Mixed, default: {} },
 
+  // Org-level policy toggles (admin-managed in Settings).
+  preferences: {
+    // How the marketing→sales handoff behaves. 'convert' creates a new deal in the
+    // target pipeline with sourcedFrom ref; 'move' updates the same deal's pipeline.
+    dealHandoffMode: { type: String, enum: ['convert', 'move'], default: 'convert' },
+    // Whether agents can delete deals at all. 'own' = only deals they created/own;
+    // 'none' = agents cannot delete deals (admins/owner still can).
+    agentDealDeletion: { type: String, enum: ['own', 'none'], default: 'own' },
+    // Whether agents can reassign deals. 'own' = only deals currently assigned to
+    // themselves (plus self-claiming unassigned deals); 'none' = admin-only.
+    // Owners/admins can always reassign regardless.
+    agentDealReassign: { type: String, enum: ['own', 'none'], default: 'own' },
+    // Additional users notified whenever a deal moves to Won. The deal's creator
+    // and assignee are always notified — these are extras (e.g. accountant, ops).
+    dealWonNotifyUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+    // Time-of-day for relative scheduled messages (before/after travel). Sends
+    // at this hour in the configured timezone instead of midnight UTC.
+    // Absolute-date messages ignore these and use the operator-picked time.
+    scheduledMessageHour: { type: Number, min: 0, max: 23, default: 9 },
+    scheduledMessageTimezone: { type: String, default: 'Africa/Nairobi' },
+    // Auto-create a draft invoice when a deal moves to a Won-typed stage.
+    // Operators using external accounting (QuickBooks, etc.) can switch off.
+    autoGenerateInvoiceOnWon: { type: Boolean, default: true },
+    // Default tax percentage applied to new invoices. Operator overrides per-invoice.
+    defaultTaxPercent: { type: Number, default: 0, min: 0, max: 100 },
+    // Payment instructions text shown at the bottom of every invoice
+    // (bank details, M-Pesa paybill, etc.). Snapshotted onto the invoice
+    // at creation; operator can override per-invoice.
+    paymentInstructions: { type: String, default: '' },
+    // External accounting webhook — fires JSON payloads on invoice lifecycle
+    // events (created, sent, paid, cancelled) so QuickBooks/Xero/n8n/Zapier
+    // can react. Separate from the n8n `webhookUrl` field above (general CRM
+    // events). Signed with HMAC-SHA256 of body using accountingWebhookSecret.
+    accountingWebhookUrl: { type: String, default: '' },
+    accountingWebhookSecret: { type: String, default: '' },
+  },
+
   // ─── Subscription & billing ────────────────────────────────────────────────
   subscriptionStatus: {
     type: String,

@@ -8,6 +8,7 @@ import {
   notifyTaskAssigned,
   notifyTaskReminder,
   notifyDealAssigned,
+  notifyDealWon,
   notifyRecordInactive,
   notifyTaskOverdue,
 } from './whatsapp.js';
@@ -42,6 +43,16 @@ function emailFor(type, p) {
         subject: `Deal assigned: ${p.dealTitle}`,
         html: `<p>Hi ${p.userName},</p><p>A new deal has been assigned to you: <strong>${p.dealTitle}</strong>.</p>`,
       };
+    case 'deal_won':
+      return {
+        subject: `Deal won: ${p.dealTitle}`,
+        html: `<p>Hi ${p.userName},</p><p>Good news — <strong>${p.dealTitle}</strong> has been marked as Won${p.byName ? ` by ${p.byName}` : ''}${p.role ? ` (${p.role})` : ''}.</p>${p.value ? `<p>Deal value: ${p.value}</p>` : ''}`,
+      };
+    case 'deal_unassigned':
+      return {
+        subject: `Deal reassigned: ${p.dealTitle}`,
+        html: `<p>Hi ${p.userName},</p><p>The deal <strong>${p.dealTitle}</strong> has been reassigned${p.newAssigneeName ? ` to ${p.newAssigneeName}` : ''}. They are now the primary contact going forward.</p>`,
+      };
     case 'record_inactive':
       return {
         subject: `Action needed: ${p.recordTitle}`,
@@ -52,14 +63,17 @@ function emailFor(type, p) {
   }
 }
 
+// Returns a Promise for WhatsApp delivery, OR null if no template exists for this type.
+// Returning null lets `notify()` fall through to email instead of silently dropping.
 function whatsappFor(type, p) {
   switch (type) {
     case 'task_assigned':   return notifyTaskAssigned(p);
     case 'task_reminder':   return notifyTaskReminder(p);
     case 'task_overdue':    return notifyTaskOverdue(p);
     case 'deal_assigned':   return notifyDealAssigned(p);
+    case 'deal_won':        return notifyDealWon(p);
     case 'record_inactive': return notifyRecordInactive(p);
-    default:                return Promise.resolve();
+    default:                return null;
   }
 }
 
@@ -75,7 +89,16 @@ export async function notify({ plan, user, type, payload }) {
   const merged = { ...payload, userName: user.name };
 
   if (allowsWhatsapp && recipientPhone) {
-    return whatsappFor(type, { to: recipientPhone, ...merged });
+    const wa = whatsappFor(type, { to: recipientPhone, ...merged });
+    if (wa) {
+      try {
+        return await wa;
+      } catch (err) {
+        // Common cause: the template isn't yet approved/registered in Meta
+        // WhatsApp Manager. Don't drop the message — fall through to email.
+        console.warn(`[notify] WhatsApp ${type} failed (${err.message}); falling back to email`);
+      }
+    }
   }
   if (recipientEmail) {
     const tpl = emailFor(type, merged);

@@ -31,7 +31,7 @@ export const protect = async (req, res, next) => {
     // Load and cache the org on every authenticated request.
     // Subscription middleware reads req.organization directly — no extra DB round-trip.
     const org = await Organization.findById(user.organization)
-      .select('subscriptionStatus plan annual trialStartedAt trialEndsAt trialQuoteCount trialQuoteLimit aiCreditsUsed aiCreditsLimit aiCreditsResetAt quotesThisMonth quotesMonthResetAt libraryImageCount currentPeriodEnd whiteLabel paystackSubscriptionCode')
+      .select('subscriptionStatus plan annual trialStartedAt trialEndsAt trialQuoteCount trialQuoteLimit aiCreditsUsed aiCreditsLimit aiCreditsResetAt quotesThisMonth quotesMonthResetAt libraryImageCount currentPeriodEnd whiteLabel paystackSubscriptionCode preferences')
       .lean();
     req.organization = org;
 

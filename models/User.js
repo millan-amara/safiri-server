@@ -37,6 +37,17 @@ const userSchema = new mongoose.Schema({
   isActive: { type: Boolean, default: true },
   lastLogin: { type: Date },
   invitedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+
+  // First-login checklist state (per-user).
+  // `onboardingDismissed` hides the whole checklist; "Getting started" sidebar link reopens it.
+  // `onboardingItemsDismissed` is an array of item ids the user has explicitly skipped
+  // (e.g. 'first_hotel' when SafiriPro is uploading their hotels manually).
+  onboardingDismissed: { type: Boolean, default: false },
+  onboardingItemsDismissed: [{ type: String }],
+
+  // Auto-restore the operator's last-used pipeline view on next CRM page load.
+  // null when they explicitly cleared (chose "All deals") last.
+  lastPipelineViewId: { type: mongoose.Schema.Types.ObjectId, ref: 'SavedView', default: null },
 }, { timestamps: true });
 
 // Compound unique: same email can exist in different orgs

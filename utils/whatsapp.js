@@ -117,3 +117,18 @@ export function notifyTaskOverdue({ to, userName, taskTitle, dueDate }) {
     dueDate ? formatDate(dueDate) : 'TBD',
   ]);
 }
+
+// client_won: Hi {{1}}, the client {{2}} has been marked as Won by {{3}}.
+// {{3}} folds the closer's name + optional role (e.g. "Mike (original creator)")
+// because WhatsApp rejects empty template parameters.
+// NOTE: This template must be created + approved in Meta WhatsApp Manager
+// before delivery will succeed. Until then notify() will fall back to email.
+export function notifyDealWon({ to, userName, dealTitle, byName, role }) {
+  const closerName = byName || 'a teammate';
+  const closer = role ? `${closerName} (${role})` : closerName;
+  return sendWhatsAppTemplate(to, 'client_won', [
+    userName,
+    dealTitle,
+    closer,
+  ]);
+}

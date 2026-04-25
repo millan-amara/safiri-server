@@ -4,14 +4,61 @@ import { Deal, Pipeline } from '../models/Deal.js';
 import Task from '../models/Task.js';
 import User from '../models/User.js';
 import Organization from '../models/Organization.js';
-import { protect } from '../middleware/auth.js';
+import ScheduledMessage from '../models/ScheduledMessage.js';
+import Invoice from '../models/Invoice.js';
+import { computeSendAt } from './scheduledMessages.js';
+import { buildInvoicePayloadFromDeal, nextInvoiceNumber } from '../services/invoiceBuilder.js';
+import { fireInvoiceWebhook } from '../services/invoiceWebhook.js';
+import { protect, authorize } from '../middleware/auth.js';
+import {
+  getAccessiblePipelineIds,
+  userCanSeePipeline,
+  requireDealAccess,
+  canDeleteDeal,
+} from '../middleware/access.js';
 import { triggerAutomation } from '../automations/engine.js';
 import { notify } from '../utils/notify.js';
+import { createNotification } from './notifications.js';
 import { requirePipelineQuota, requireTrialContactQuota } from '../middleware/partnerQuota.js';
 
 const router = Router();
 
+const ADMIN_ROLES = ['owner', 'admin'];
+const isAdmin = (user) => ADMIN_ROLES.includes(user.role);
+
+// Build per-pipeline $or clauses for filtering deals by stage *type*.
+// Returns { won: [...], lost: [...], open: [...] } where each entry is
+// `{ pipeline: id, stage: { $in: [stageNames] } }`. This is the source of
+// truth for "which stages count as Won/Lost" across pipelines that use
+// different stage names (e.g. Marketing's "Handed to Sales" = won).
+async function buildStageTypeOrs(organizationId) {
+  const pipelines = await Pipeline.find({ organization: organizationId, isActive: true })
+    .select('stages').lean();
+  const result = { won: [], lost: [], open: [] };
+  for (const p of pipelines) {
+    for (const t of ['won', 'lost', 'open']) {
+      const names = (p.stages || [])
+        .filter(s => (s.type || 'open') === t)
+        .map(s => s.name);
+      if (names.length > 0) {
+        result[t].push({ pipeline: p._id, stage: { $in: names } });
+      }
+    }
+  }
+  return result;
+}
+
+// Compose a Mongo filter: baseFilter AND deal is in a stage of the given type.
+// Returns a filter that matches nothing if no stages of that type exist anywhere.
+function withStageType(baseFilter, stageOrs, type) {
+  const clauses = stageOrs[type] || [];
+  if (clauses.length === 0) return { ...baseFilter, _id: null };
+  return { ...baseFilter, $or: clauses };
+}
+
 // ─── CONTACTS ────────────────────────────────────────
+// Contacts are org-scoped, not pipeline-scoped — every authenticated user can read.
+// Per the role matrix: agent+ can create/edit; only admin+ can delete.
 
 router.get('/contacts', protect, async (req, res) => {
   try {
@@ -38,11 +85,15 @@ router.get('/contacts/:id', protect, async (req, res) => {
       .populate('assignedTo', 'name avatar');
     if (!contact) return res.status(404).json({ message: 'Contact not found' });
 
-    const deals = await Deal.find({ contact: contact._id, organization: req.organizationId })
+    // Filter the linked-deals/tasks listing by what this user is allowed to see.
+    const accessiblePipelines = await getAccessiblePipelineIds(req.user);
+    const dealFilter = { contact: contact._id, organization: req.organizationId };
+    if (!isAdmin(req.user)) dealFilter.pipeline = { $in: accessiblePipelines };
+
+    const deals = await Deal.find(dealFilter)
       .populate('pipeline', 'name')
       .sort({ createdAt: -1 });
 
-    // Fetch tasks linked to this contact's deals
     const dealIds = deals.map(d => d._id);
     const tasks = await Task.find({
       organization: req.organizationId,
@@ -62,7 +113,7 @@ router.get('/contacts/:id', protect, async (req, res) => {
   }
 });
 
-router.post('/contacts', protect, requireTrialContactQuota, async (req, res) => {
+router.post('/contacts', protect, authorize('owner', 'admin', 'agent'), requireTrialContactQuota, async (req, res) => {
   try {
     const contact = await Contact.create({ ...req.body, organization: req.organizationId });
     triggerAutomation('contact.created', { organizationId: req.organizationId, contact, userId: req.user._id });
@@ -72,7 +123,7 @@ router.post('/contacts', protect, requireTrialContactQuota, async (req, res) => 
   }
 });
 
-router.put('/contacts/:id', protect, async (req, res) => {
+router.put('/contacts/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const contact = await Contact.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -86,7 +137,7 @@ router.put('/contacts/:id', protect, async (req, res) => {
   }
 });
 
-router.delete('/contacts/:id', protect, async (req, res) => {
+router.delete('/contacts/:id', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     await Contact.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -99,17 +150,29 @@ router.delete('/contacts/:id', protect, async (req, res) => {
 });
 
 // ─── PIPELINES ────────────────────────────────────────
+// Visibility: every authenticated user can list, but the list is filtered to
+// pipelines they have access to. Structural changes (create/update/delete) are admin-only.
 
 router.get('/pipelines', protect, async (req, res) => {
   try {
-    const pipelines = await Pipeline.find({ organization: req.organizationId, isActive: true });
+    const baseFilter = { organization: req.organizationId, isActive: true };
+    const filter = isAdmin(req.user)
+      ? baseFilter
+      : {
+          ...baseFilter,
+          $or: [
+            { visibility: 'organization' },
+            { visibility: 'members', members: req.user._id },
+          ],
+        };
+    const pipelines = await Pipeline.find(filter);
     res.json({ pipelines });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-router.post('/pipelines', protect, requirePipelineQuota, async (req, res) => {
+router.post('/pipelines', protect, authorize('owner', 'admin'), requirePipelineQuota, async (req, res) => {
   try {
     const pipeline = await Pipeline.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(pipeline);
@@ -118,7 +181,7 @@ router.post('/pipelines', protect, requirePipelineQuota, async (req, res) => {
   }
 });
 
-router.put('/pipelines/:id', protect, async (req, res) => {
+router.put('/pipelines/:id', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     const pipeline = await Pipeline.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -132,7 +195,7 @@ router.put('/pipelines/:id', protect, async (req, res) => {
   }
 });
 
-router.delete('/pipelines/:id', protect, async (req, res) => {
+router.delete('/pipelines/:id', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     const pipeline = await Pipeline.findOne({ _id: req.params.id, organization: req.organizationId });
     if (!pipeline) return res.status(404).json({ message: 'Not found' });
@@ -146,14 +209,28 @@ router.delete('/pipelines/:id', protect, async (req, res) => {
 });
 
 // ─── DEALS ────────────────────────────────────────
+// Visibility filtered by accessible pipelines. Viewers read-only.
+// Agents can create/edit in pipelines they have access to. Delete is policy-driven (canDeleteDeal).
 
 router.get('/deals', protect, async (req, res) => {
   try {
-    const { pipeline, stage, assignedTo, page = 1, limit = 100 } = req.query;
+    const { pipeline, stage, assignedTo, createdBy, page = 1, limit = 100 } = req.query;
     const filter = { organization: req.organizationId, isActive: true };
-    if (pipeline) filter.pipeline = pipeline;
+
+    const accessiblePipelines = await getAccessiblePipelineIds(req.user);
+
+    if (pipeline) {
+      // If the caller filters by a specific pipeline, check they can see it.
+      const ok = accessiblePipelines.some(p => String(p) === String(pipeline));
+      if (!ok) return res.status(403).json({ message: 'No access to this pipeline' });
+      filter.pipeline = pipeline;
+    } else if (!isAdmin(req.user)) {
+      filter.pipeline = { $in: accessiblePipelines };
+    }
+
     if (stage) filter.stage = stage;
-    if (assignedTo) filter.assignedTo = assignedTo;
+    if (assignedTo) filter.assignedTo = assignedTo === 'me' ? req.user._id : assignedTo;
+    if (createdBy) filter.createdBy = createdBy === 'me' ? req.user._id : createdBy;
 
     const deals = await Deal.find(filter)
       .populate('contact', 'firstName lastName email phone')
@@ -171,16 +248,15 @@ router.get('/deals', protect, async (req, res) => {
   }
 });
 
-router.get('/deals/:id', protect, async (req, res) => {
+router.get('/deals/:id', protect, requireDealAccess(), async (req, res) => {
   try {
-    const deal = await Deal.findOne({ _id: req.params.id, organization: req.organizationId })
+    const deal = await Deal.findById(req.deal._id)
       .populate('contact')
       .populate('createdBy', 'name avatar')
       .populate('assignedTo', 'name avatar email')
       .populate('pipeline', 'name stages')
       .populate('quotes')
       .populate('notes.createdBy', 'name avatar');
-    if (!deal) return res.status(404).json({ message: 'Deal not found' });
 
     // Auto-migrate old string notes to array
     if (!Array.isArray(deal.notes)) {
@@ -202,8 +278,21 @@ router.get('/deals/:id', protect, async (req, res) => {
   }
 });
 
-router.post('/deals', protect, async (req, res) => {
+router.post('/deals', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
+    const pipelineId = req.body.pipeline;
+    if (!pipelineId) return res.status(400).json({ message: 'Pipeline is required' });
+
+    const pipeline = await Pipeline.findOne({
+      _id: pipelineId,
+      organization: req.organizationId,
+      isActive: true,
+    }).lean();
+    if (!pipeline) return res.status(404).json({ message: 'Pipeline not found' });
+    if (!userCanSeePipeline(req.user, pipeline)) {
+      return res.status(403).json({ message: 'No access to this pipeline' });
+    }
+
     const deal = await Deal.create({
       ...req.body,
       organization: req.organizationId,
@@ -219,10 +308,8 @@ router.post('/deals', protect, async (req, res) => {
       .populate('assignedTo', 'name avatar')
       .populate('pipeline', 'name stages');
 
-    // Fire automation
     triggerAutomation('deal.created', { organizationId: req.organizationId, deal, userId: req.user._id });
 
-    // WhatsApp — notify assignee if they have a phone
     if (deal.assignedTo) {
       User.findById(deal.assignedTo).select('name phone').lean()
         .then(assignee => notify({
@@ -240,12 +327,29 @@ router.post('/deals', protect, async (req, res) => {
   }
 });
 
-router.put('/deals/:id', protect, async (req, res) => {
+router.put('/deals/:id', protect, authorize('owner', 'admin', 'agent'), requireDealAccess(), async (req, res) => {
   try {
-    const existing = await Deal.findOne({ _id: req.params.id, organization: req.organizationId });
-    if (!existing) return res.status(404).json({ message: 'Not found' });
+    const existing = req.deal;
 
-    // Track stage changes
+    // The pipeline whose stages we'll consult for type lookups. Defaults to the
+    // deal's current pipeline (already loaded by requireDealAccess); replaced
+    // with the target if the caller is moving the deal across pipelines.
+    let targetPipeline = req.pipeline;
+
+    // If the caller is moving the deal to a different pipeline, they must also have access to the target.
+    if (req.body.pipeline && String(req.body.pipeline) !== String(existing.pipeline)) {
+      const target = await Pipeline.findOne({
+        _id: req.body.pipeline,
+        organization: req.organizationId,
+        isActive: true,
+      }).lean();
+      if (!target) return res.status(404).json({ message: 'Target pipeline not found' });
+      if (!userCanSeePipeline(req.user, target)) {
+        return res.status(403).json({ message: 'No access to target pipeline' });
+      }
+      targetPipeline = target;
+    }
+
     if (req.body.stage && req.body.stage !== existing.stage) {
       existing.activities.push({
         type: 'stage_change',
@@ -253,11 +357,18 @@ router.put('/deals/:id', protect, async (req, res) => {
         createdBy: req.user._id,
       });
 
-      // Record wonAt timestamp for performance tracking
-      if (req.body.stage === 'Won' && !existing.wonAt) {
+      // Look up the destination stage's semantic type. We rely on `type` rather
+      // than name so custom-named pipelines (e.g. Marketing's "Handed to Sales")
+      // still trigger the right won/lost flows.
+      const targetStage = (targetPipeline?.stages || []).find(s => s.name === req.body.stage);
+      const targetType = targetStage?.type || 'open';
+      const isWon = targetType === 'won';
+      const isLost = targetType === 'lost';
+
+      if (isWon && !existing.wonAt) {
         req.body.wonAt = new Date();
       }
-      if (req.body.stage === 'Lost' && !existing.lostAt) {
+      if (isLost && !existing.lostAt) {
         req.body.lostAt = new Date();
       }
 
@@ -268,37 +379,207 @@ router.put('/deals/:id', protect, async (req, res) => {
         toStage: req.body.stage,
       });
 
-      if (req.body.stage === 'Won') {
+      if (isWon) {
         triggerAutomation('deal.won', { organizationId: req.organizationId, deal: existing, userId: req.user._id });
-      } else if (req.body.stage === 'Lost') {
+        // ── Deal-won notification routing ─────────────────────────────────
+        // Always notify the deal's original creator (closes the marketer
+        // feedback loop) plus any users on org.preferences.dealWonNotifyUsers.
+        // Skip the user who actually closed the deal — they don't need a ping.
+        try {
+          const recipientIds = new Set();
+          if (existing.createdBy && String(existing.createdBy) !== String(req.user._id)) {
+            recipientIds.add(String(existing.createdBy));
+          }
+          const extras = req.organization?.preferences?.dealWonNotifyUsers || [];
+          for (const uid of extras) {
+            const s = String(uid);
+            if (s !== String(req.user._id)) recipientIds.add(s);
+          }
+
+          if (recipientIds.size > 0) {
+            const recipients = await User.find({
+              _id: { $in: [...recipientIds] },
+              organization: req.organizationId,
+              isActive: true,
+            }).select('name phone email').lean();
+
+            const closer = req.user.name || 'A teammate';
+            const dealValue = existing.value
+              ? `${existing.currency || 'USD'} ${Number(existing.value).toLocaleString()}`
+              : null;
+
+            for (const r of recipients) {
+              createNotification({
+                organization: req.organizationId,
+                user: r._id,
+                type: 'deal_won',
+                title: `Deal won: ${existing.title}`,
+                message: `${closer} marked this as Won.`,
+                entityType: 'deal',
+                entityId: existing._id,
+              });
+              const role = String(r._id) === String(existing.createdBy) ? 'original creator' : null;
+              notify({
+                plan: req.organization?.plan,
+                user: r,
+                type: 'deal_won',
+                payload: { dealTitle: existing.title, byName: closer, role, value: dealValue },
+              }).catch(err => console.error('[notify] deal_won failed:', err.message));
+            }
+          }
+        } catch (err) {
+          console.error('Deal-won notification routing failed:', err.message);
+        }
+
+        // ── Auto-draft an invoice on Won ───────────────────────────────────
+        // Skipped if the org has disabled the preference, or if this deal
+        // already has an invoice (e.g. operator generated one manually before
+        // closing). Best-effort: any error logs but doesn't break the stage
+        // transition or block the response.
+        if (req.organization?.preferences?.autoGenerateInvoiceOnWon !== false) {
+          try {
+            const dupInvoice = await Invoice.findOne({ deal: existing._id }).select('_id').lean();
+            if (!dupInvoice) {
+              const populatedDeal = await Deal.findById(existing._id)
+                .populate('contact', 'firstName lastName email phone company');
+              const fullOrg = await Organization.findById(req.organizationId).lean();
+              const payload = await buildInvoicePayloadFromDeal({
+                deal: populatedDeal,
+                org: fullOrg,
+              });
+              payload.invoiceNumber = await nextInvoiceNumber(req.organizationId);
+              payload.createdBy = req.user._id;
+              const autoInvoice = await Invoice.create(payload);
+              fireInvoiceWebhook('invoice.created', autoInvoice);
+            }
+          } catch (err) {
+            console.error('[crm] auto-invoice generation on Won failed:', err.message);
+          }
+        }
+      } else if (isLost) {
         triggerAutomation('deal.lost', { organizationId: req.organizationId, deal: existing, userId: req.user._id });
+        // A lost deal shouldn't keep sending packing tips / review-requests.
+        // Cancel any pending scheduled messages so the operator doesn't have
+        // to remember to clean each one up manually.
+        await ScheduledMessage.updateMany(
+          { deal: existing._id, status: { $in: ['scheduled', 'overdue'] } },
+          { $set: { status: 'cancelled' } },
+        ).catch(err => console.error('[crm] cancel scheduled messages on Lost failed:', err.message));
       }
     }
 
-    // Track assignment changes
+    // Detect travel-date changes BEFORE Object.assign overwrites them. Used
+    // below (after save) to recompute sendAt for any relative scheduled messages.
+    const travelDatesChanged =
+      (req.body.travelDates?.start &&
+        new Date(req.body.travelDates.start).getTime() !==
+          new Date(existing.travelDates?.start || 0).getTime()) ||
+      (req.body.travelDates?.end &&
+        new Date(req.body.travelDates.end).getTime() !==
+          new Date(existing.travelDates?.end || 0).getTime());
+
+    // Assignment change — three layers of validation:
+    //   1. Org reassignment policy (agents only — admins always allowed)
+    //   2. New assignee exists in the org
+    //   3. New assignee has access to the target pipeline (otherwise the deal
+    //      becomes invisible to them and notifications point at nothing they can open)
     if (req.body.assignedTo && req.body.assignedTo.toString() !== existing.assignedTo?.toString()) {
+      // Policy enforcement for agents.
+      if (!ADMIN_ROLES.includes(req.user.role)) {
+        const policy = req.organization?.preferences?.agentDealReassign || 'own';
+        if (policy === 'none') {
+          return res.status(403).json({
+            message: 'Only owners and admins can change deal assignments in this organization.',
+            code: 'AGENT_REASSIGN_BLOCKED',
+          });
+        }
+        if (policy === 'own') {
+          const isCurrentAssignee = existing.assignedTo &&
+            String(existing.assignedTo) === String(req.user._id);
+          const isSelfClaim = !existing.assignedTo &&
+            String(req.body.assignedTo) === String(req.user._id);
+          if (!isCurrentAssignee && !isSelfClaim) {
+            return res.status(403).json({
+              message: 'You can only reassign deals currently assigned to you. Ask an admin to reassign deals owned by other teammates.',
+              code: 'AGENT_REASSIGN_OWN_ONLY',
+            });
+          }
+        }
+      }
+
+      const newAssignee = await User.findOne({
+        _id: req.body.assignedTo,
+        organization: req.organizationId,
+        isActive: true,
+      }).select('name phone email role').lean();
+      if (!newAssignee) {
+        return res.status(400).json({ message: 'Assignee not found in this organization' });
+      }
+      if (!userCanSeePipeline(newAssignee, targetPipeline)) {
+        return res.status(400).json({
+          message: `${newAssignee.name || 'That user'} doesn't have access to this pipeline. Add them as a pipeline member first.`,
+          code: 'ASSIGNEE_NO_PIPELINE_ACCESS',
+        });
+      }
+
       try {
-        const newUser = await User.findById(req.body.assignedTo).select('name phone');
-        const oldUser = existing.assignedTo ? await User.findById(existing.assignedTo).select('name') : null;
+        const oldUser = existing.assignedTo
+          ? await User.findById(existing.assignedTo).select('name phone email').lean()
+          : null;
         existing.activities.push({
           type: 'assignment_change',
-          description: `${req.user.name} reassigned from ${oldUser?.name || 'unassigned'} to ${newUser?.name || 'unknown'}`,
+          description: `${req.user.name} reassigned from ${oldUser?.name || 'unassigned'} to ${newAssignee.name || 'unknown'}`,
           createdBy: req.user._id,
         });
-        // WhatsApp — notify the newly assigned user
-        if (newUser) {
+        // Notify the new assignee so they pick up the work.
+        notify({
+          plan: req.organization?.plan,
+          user: newAssignee,
+          type: 'deal_assigned',
+          payload: { dealTitle: existing.title },
+        }).catch(err => console.error('[notify] deal_assigned (reassign) failed:', err.message));
+        // Notify the previous assignee that the deal moved off their queue —
+        // skip if they're the one making the change (no self-notification).
+        if (oldUser && String(oldUser._id) !== String(req.user._id)) {
           notify({
             plan: req.organization?.plan,
-            user: newUser,
-            type: 'deal_assigned',
-            payload: { dealTitle: existing.title },
-          }).catch(err => console.error('[notify] deal_assigned (reassign) failed:', err.message));
+            user: oldUser,
+            type: 'deal_unassigned',
+            payload: { dealTitle: existing.title, newAssigneeName: newAssignee.name || 'someone else' },
+          }).catch(err => console.error('[notify] deal_unassigned failed:', err.message));
         }
-      } catch (err) { /* silent */ }
+      } catch (err) { /* silent — notifications are best-effort */ }
     }
 
     Object.assign(existing, req.body);
     await existing.save();
+
+    // If travel dates moved, recompute sendAt for any relative scheduled
+    // messages on this deal. Messages whose new send time is in the past
+    // get flagged 'overdue' so the operator decides whether to send anyway.
+    if (travelDatesChanged) {
+      try {
+        const relativeMessages = await ScheduledMessage.find({
+          deal: existing._id,
+          status: { $in: ['scheduled', 'overdue'] },
+          'timing.mode': { $in: ['before_travel_start', 'after_travel_end'] },
+        });
+        const sendTimeOpts = {
+          hour: req.organization?.preferences?.scheduledMessageHour ?? 9,
+          timezone: req.organization?.preferences?.scheduledMessageTimezone || 'Africa/Nairobi',
+        };
+        const now = new Date();
+        for (const msg of relativeMessages) {
+          const newSendAt = computeSendAt(msg.timing, existing, sendTimeOpts);
+          if (!newSendAt) continue;
+          msg.sendAt = newSendAt;
+          msg.status = newSendAt < now ? 'overdue' : 'scheduled';
+          await msg.save();
+        }
+      } catch (err) {
+        console.error('[crm] recompute scheduled messages on date change failed:', err.message);
+      }
+    }
 
     const populated = await Deal.findById(existing._id)
       .populate('contact', 'firstName lastName email')
@@ -310,24 +591,28 @@ router.put('/deals/:id', protect, async (req, res) => {
   }
 });
 
-router.delete('/deals/:id', protect, async (req, res) => {
+router.delete('/deals/:id', protect, requireDealAccess(), async (req, res) => {
   try {
-    await Deal.findOneAndUpdate(
-      { _id: req.params.id, organization: req.organizationId },
-      { isActive: false }
-    );
+    if (!canDeleteDeal(req.user, req.deal, req.organization)) {
+      return res.status(403).json({ message: 'You do not have permission to delete this deal' });
+    }
+    req.deal.isActive = false;
+    await req.deal.save();
+    // Cancel pending scheduled messages — an archived deal shouldn't keep emailing.
+    await ScheduledMessage.updateMany(
+      { deal: req.deal._id, status: { $in: ['scheduled', 'overdue'] } },
+      { $set: { status: 'cancelled' } },
+    ).catch(err => console.error('[crm] cancel scheduled messages on delete failed:', err.message));
     res.json({ message: 'Deleted' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-// Add activity to deal
-router.post('/deals/:id/activities', protect, async (req, res) => {
+// Add activity to deal — non-viewer only
+router.post('/deals/:id/activities', protect, authorize('owner', 'admin', 'agent'), requireDealAccess(), async (req, res) => {
   try {
-    const deal = await Deal.findOne({ _id: req.params.id, organization: req.organizationId });
-    if (!deal) return res.status(404).json({ message: 'Not found' });
-
+    const deal = req.deal;
     deal.activities.push({ ...req.body, createdBy: req.user._id });
     await deal.save();
     res.json(deal);
@@ -336,13 +621,11 @@ router.post('/deals/:id/activities', protect, async (req, res) => {
   }
 });
 
-// Add note to deal
-router.post('/deals/:id/notes', protect, async (req, res) => {
+// Add note to deal — non-viewer only
+router.post('/deals/:id/notes', protect, authorize('owner', 'admin', 'agent'), requireDealAccess(), async (req, res) => {
   try {
-    const deal = await Deal.findOne({ _id: req.params.id, organization: req.organizationId });
-    if (!deal) return res.status(404).json({ message: 'Not found' });
+    const deal = req.deal;
 
-    // Migrate old string notes to array if needed
     if (!Array.isArray(deal.notes)) {
       const oldNote = deal.notes;
       deal.notes = [];
@@ -362,8 +645,8 @@ router.post('/deals/:id/notes', protect, async (req, res) => {
   }
 });
 
-// Delete note
-router.delete('/deals/:id/notes/:noteId', protect, async (req, res) => {
+// Delete note — non-viewer only
+router.delete('/deals/:id/notes/:noteId', protect, authorize('owner', 'admin', 'agent'), requireDealAccess(), async (req, res) => {
   try {
     await Deal.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -375,12 +658,10 @@ router.delete('/deals/:id/notes/:noteId', protect, async (req, res) => {
   }
 });
 
-// Pin/unpin note
-router.put('/deals/:id/notes/:noteId', protect, async (req, res) => {
+// Pin/unpin note — non-viewer only
+router.put('/deals/:id/notes/:noteId', protect, authorize('owner', 'admin', 'agent'), requireDealAccess(), async (req, res) => {
   try {
-    const deal = await Deal.findOne({ _id: req.params.id, organization: req.organizationId });
-    if (!deal) return res.status(404).json({ message: 'Not found' });
-
+    const deal = req.deal;
     const note = deal.notes.id(req.params.noteId);
     if (!note) return res.status(404).json({ message: 'Note not found' });
 
@@ -393,6 +674,9 @@ router.put('/deals/:id/notes/:noteId', protect, async (req, res) => {
 });
 
 // ─── TASKS ────────────────────────────────────────
+// Tasks linked to a deal inherit that deal's pipeline access.
+// Tasks not linked to a deal are visible org-wide.
+// Agents can edit/delete only tasks they created or are assigned to. Viewers read-only.
 
 router.get('/tasks', protect, async (req, res) => {
   try {
@@ -401,6 +685,33 @@ router.get('/tasks', protect, async (req, res) => {
     if (status) filter.status = status;
     if (assignedTo) filter.assignedTo = assignedTo;
     if (deal) filter.deal = deal;
+
+    if (!isAdmin(req.user)) {
+      const accessiblePipelines = await getAccessiblePipelineIds(req.user);
+      const accessibleDeals = await Deal.find({
+        organization: req.organizationId,
+        pipeline: { $in: accessiblePipelines },
+        isActive: true,
+      }).select('_id').lean();
+      const accessibleDealIds = accessibleDeals.map(d => d._id);
+
+      // A task is visible to a non-admin if any of these is true:
+      //   - it has no deal (general org task)
+      //   - its deal is in their accessible pipelines
+      //   - they are the assignee or creator (regardless of deal access)
+      filter.$and = [
+        ...(filter.$and || []),
+        {
+          $or: [
+            { deal: { $in: [null, undefined] } },
+            { deal: { $exists: false } },
+            { deal: { $in: accessibleDealIds } },
+            { assignedTo: req.user._id },
+            { createdBy: req.user._id },
+          ],
+        },
+      ];
+    }
 
     const tasks = await Task.find(filter)
       .populate('assignedTo', 'name avatar')
@@ -413,8 +724,26 @@ router.get('/tasks', protect, async (req, res) => {
   }
 });
 
-router.post('/tasks', protect, async (req, res) => {
+router.post('/tasks', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
+    // If the task is linked to a deal, the user must have access to that deal's pipeline.
+    if (req.body.deal) {
+      const deal = await Deal.findOne({
+        _id: req.body.deal,
+        organization: req.organizationId,
+        isActive: true,
+      }).select('pipeline').lean();
+      if (!deal) return res.status(404).json({ message: 'Linked deal not found' });
+
+      const pipeline = await Pipeline.findOne({
+        _id: deal.pipeline,
+        organization: req.organizationId,
+      }).lean();
+      if (!pipeline || !userCanSeePipeline(req.user, pipeline)) {
+        return res.status(403).json({ message: 'No access to the linked deal' });
+      }
+    }
+
     const task = await Task.create({
       ...req.body,
       organization: req.organizationId,
@@ -424,11 +753,9 @@ router.post('/tasks', protect, async (req, res) => {
       .populate('assignedTo', 'name avatar')
       .populate('deal', 'title');
 
-    // Fire automation if assigned
     if (task.assignedTo) {
       triggerAutomation('task.assigned', { organizationId: req.organizationId, task, userId: req.user._id });
 
-      // WhatsApp — notify assignee if they have a phone
       User.findById(task.assignedTo).select('name phone').lean()
         .then(assignee => notify({
           plan: req.organization?.plan,
@@ -439,24 +766,31 @@ router.post('/tasks', protect, async (req, res) => {
         .catch(err => console.error('[notify] task_assigned failed:', err.message));
     }
 
-    // Task reminder fires automatically via the poller — reminderSentAt defaults to null.
-
     res.status(201).json(populated);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
-router.put('/tasks/:id', protect, async (req, res) => {
+router.put('/tasks/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
+    const prior = await Task.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!prior) return res.status(404).json({ message: 'Not found' });
+
+    // Agents can only edit tasks they created or are assigned to.
+    if (!isAdmin(req.user)) {
+      const isOwner =
+        String(prior.createdBy) === String(req.user._id) ||
+        String(prior.assignedTo) === String(req.user._id);
+      if (!isOwner) return res.status(403).json({ message: 'You can only edit your own tasks' });
+    }
+
     if (req.body.status === 'done') req.body.completedAt = new Date();
-    const prior = await Task.findOne({ _id: req.params.id, organization: req.organizationId })
-      .select('assignedTo dueDate reminderHours').lean();
 
     const dueDateChanged = 'dueDate' in req.body &&
-      new Date(req.body.dueDate || 0).getTime() !== new Date(prior?.dueDate || 0).getTime();
+      new Date(req.body.dueDate || 0).getTime() !== new Date(prior.dueDate || 0).getTime();
     const reminderHoursChanged = 'reminderHours' in req.body &&
-      req.body.reminderHours !== prior?.reminderHours;
+      req.body.reminderHours !== prior.reminderHours;
     if (dueDateChanged || reminderHoursChanged) {
       req.body.reminderSentAt = null;
     }
@@ -466,10 +800,9 @@ router.put('/tasks/:id', protect, async (req, res) => {
       req.body,
       { new: true }
     ).populate('assignedTo', 'name avatar');
-    if (!task) return res.status(404).json({ message: 'Not found' });
 
     const newAssignee = task.assignedTo?._id || task.assignedTo;
-    const priorAssignee = prior?.assignedTo;
+    const priorAssignee = prior.assignedTo;
     if (newAssignee && String(newAssignee) !== String(priorAssignee || '')) {
       triggerAutomation('task.assigned', { organizationId: req.organizationId, task, userId: req.user._id });
     }
@@ -480,30 +813,100 @@ router.put('/tasks/:id', protect, async (req, res) => {
   }
 });
 
-router.delete('/tasks/:id', protect, async (req, res) => {
+router.delete('/tasks/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
-    await Task.findOneAndDelete({ _id: req.params.id, organization: req.organizationId });
+    const task = await Task.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!task) return res.status(404).json({ message: 'Not found' });
+
+    if (!isAdmin(req.user)) {
+      const isOwner =
+        String(task.createdBy) === String(req.user._id) ||
+        String(task.assignedTo) === String(req.user._id);
+      if (!isOwner) return res.status(403).json({ message: 'You can only delete your own tasks' });
+    }
+
+    await Task.findByIdAndDelete(task._id);
     res.json({ message: 'Deleted' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 });
 
+// ─── MY SOURCED LEADS ───────────────────────────────
+// Per-user view of "what happened to leads I sourced" (Deal.createdBy === me).
+// Closes the feedback loop for marketers handing leads off to sales (and for
+// salespeople tracking their own inbound). Counts across ALL pipelines.
+
+router.get('/my-leads-stats', protect, async (req, res) => {
+  try {
+    const orgId = req.organizationId;
+    const myId = req.user._id;
+    const baseFilter = { organization: orgId, createdBy: myId, isActive: true };
+
+    const stageOrs = await buildStageTypeOrs(orgId);
+
+    const [totalSourced, inProgress, wonByMe, wonByTeammate, lostCount, recentActive] = await Promise.all([
+      Deal.countDocuments(baseFilter),
+      Deal.countDocuments(withStageType(baseFilter, stageOrs, 'open')),
+      Deal.countDocuments(withStageType({ ...baseFilter, assignedTo: myId }, stageOrs, 'won')),
+      Deal.countDocuments(withStageType({ ...baseFilter, assignedTo: { $ne: myId } }, stageOrs, 'won')),
+      Deal.countDocuments(withStageType(baseFilter, stageOrs, 'lost')),
+      Deal.find(baseFilter)
+        .populate('contact', 'firstName lastName')
+        .populate('assignedTo', 'name avatar')
+        .populate('pipeline', 'name')
+        .sort({ updatedAt: -1 })
+        .limit(5)
+        .lean(),
+    ]);
+
+    const wonTotal = wonByMe + wonByTeammate;
+    const closedTotal = wonTotal + lostCount;
+    const conversionRate = closedTotal > 0 ? Math.round((wonTotal / closedTotal) * 100) : 0;
+
+    res.json({
+      totalSourced,
+      inProgress,
+      won: wonTotal,
+      wonByMe,
+      wonByTeammate,
+      lost: lostCount,
+      conversionRate,
+      recentActive,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // ─── DASHBOARD STATS ────────────────────────────────
+// Filtered by accessible pipelines for non-admins. Viewers see counts only for
+// pipelines they have access to (a viewer with no membership sees near-zero stats).
 
 router.get('/stats', protect, async (req, res) => {
   try {
     const orgId = req.organizationId;
-    const [contacts, activeDeals, tasks, wonDeals] = await Promise.all([
+
+    const accessiblePipelines = await getAccessiblePipelineIds(req.user);
+    const dealScope = isAdmin(req.user)
+      ? { organization: orgId }
+      : { organization: orgId, pipeline: { $in: accessiblePipelines } };
+
+    // Stage-type filters used throughout. Built once, reused across all the
+    // won/lost/active counters below so we don't refetch pipelines repeatedly.
+    const stageOrs = await buildStageTypeOrs(orgId);
+
+    const [contacts, activeDeals, tasks, wonDeals, lostDeals] = await Promise.all([
       Contact.countDocuments({ organization: orgId, isActive: true }),
-      Deal.countDocuments({ organization: orgId, isActive: true, stage: { $nin: ['Won', 'Lost'] } }),
+      Deal.countDocuments(withStageType({ ...dealScope, isActive: true }, stageOrs, 'open')),
       Task.countDocuments({ organization: orgId, status: { $in: ['todo', 'in_progress'] } }),
-      Deal.find({ organization: orgId, stage: 'Won' }).select('value currency'),
+      Deal.find(withStageType(dealScope, stageOrs, 'won')).select('value currency'),
+      Deal.countDocuments(withStageType(dealScope, stageOrs, 'lost')),
     ]);
 
     const totalRevenue = wonDeals.reduce((sum, d) => sum + (d.value || 0), 0);
 
-    const recentDeals = await Deal.find({ organization: orgId, isActive: true })
+    const recentDeals = await Deal.find({ ...dealScope, isActive: true })
       .populate('contact', 'firstName lastName')
       .sort({ updatedAt: -1 })
       .limit(5);
@@ -516,56 +919,67 @@ router.get('/stats', protect, async (req, res) => {
       .sort({ dueDate: 1 })
       .limit(5);
 
-    // Pipeline breakdown
     const pipelineStats = await Deal.aggregate([
-      { $match: { organization: orgId, isActive: true } },
+      { $match: { ...dealScope, isActive: true } },
       { $group: { _id: '$stage', count: { $sum: 1 }, totalValue: { $sum: '$value' } } },
     ]);
 
-    // Monthly deals (last 6 months) for chart
+    // Monthly chart — total/value comes from a simple aggregate; "won" comes
+    // from a separate type-aware count and we merge by month-key.
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-    const monthlyDeals = await Deal.aggregate([
-      { $match: { organization: orgId, createdAt: { $gte: sixMonthsAgo } } },
+    const monthlyTotals = await Deal.aggregate([
+      { $match: { ...dealScope, createdAt: { $gte: sixMonthsAgo } } },
       {
         $group: {
           _id: { $dateToString: { format: '%Y-%m', date: '$createdAt' } },
           count: { $sum: 1 },
           value: { $sum: '$value' },
-          won: { $sum: { $cond: [{ $eq: ['$stage', 'Won'] }, 1, 0] } },
         },
       },
-      { $sort: { _id: 1 } },
     ]);
+    const monthlyWonRaw = await Deal.aggregate([
+      { $match: withStageType({ ...dealScope, createdAt: { $gte: sixMonthsAgo } }, stageOrs, 'won') },
+      {
+        $group: {
+          _id: { $dateToString: { format: '%Y-%m', date: '$createdAt' } },
+          won: { $sum: 1 },
+        },
+      },
+    ]);
+    const monthlyMap = new Map();
+    for (const m of monthlyTotals) monthlyMap.set(m._id, { _id: m._id, count: m.count, value: m.value, won: 0 });
+    for (const w of monthlyWonRaw) {
+      const cur = monthlyMap.get(w._id) || { _id: w._id, count: 0, value: 0, won: 0 };
+      cur.won = w.won;
+      monthlyMap.set(w._id, cur);
+    }
+    const monthlyDeals = [...monthlyMap.values()].sort((a, b) => a._id.localeCompare(b._id));
 
-    // Conversion rate
-    const totalDealsEver = await Deal.countDocuments({ organization: orgId });
+    const totalDealsEver = await Deal.countDocuments(dealScope);
     const conversionRate = totalDealsEver > 0 ? Math.round((wonDeals.length / totalDealsEver) * 100) : 0;
 
-    // Quotes stats
     const Quote = (await import('../models/Quote.js')).default;
     const totalQuotes = await Quote.countDocuments({ organization: orgId });
     const viewedQuotes = await Quote.countDocuments({ organization: orgId, status: { $in: ['viewed', 'accepted'] } });
 
-    // Team performance — per member stats
-    const User = (await import('../models/User.js')).default;
     const teamMembers = await User.find({ organization: orgId, isActive: true }).select('name avatar role');
 
     const teamPerformance = await Promise.all(teamMembers.map(async (member) => {
       const mid = member._id;
+      const memberScope = { ...dealScope, assignedTo: mid };
       const [created, won, lost, quotesCreated, activeDealCount] = await Promise.all([
-        Deal.countDocuments({ organization: orgId, $or: [{ createdBy: mid }, { assignedTo: mid }] }),
-        Deal.countDocuments({ organization: orgId, assignedTo: mid, stage: 'Won' }),
-        Deal.countDocuments({ organization: orgId, assignedTo: mid, stage: 'Lost' }),
+        Deal.countDocuments({ ...dealScope, $or: [{ createdBy: mid }, { assignedTo: mid }] }),
+        Deal.countDocuments(withStageType(memberScope, stageOrs, 'won')),
+        Deal.countDocuments(withStageType(memberScope, stageOrs, 'lost')),
         Quote.countDocuments({ organization: orgId, createdBy: mid }),
-        Deal.countDocuments({ organization: orgId, assignedTo: mid, isActive: true, stage: { $nin: ['Won', 'Lost'] } }),
+        Deal.countDocuments(withStageType({ ...memberScope, isActive: true }, stageOrs, 'open')),
       ]);
 
-      // Revenue closed
-      const wonDealsForMember = await Deal.find({ organization: orgId, assignedTo: mid, stage: 'Won' }).select('value createdAt wonAt');
+      const wonDealsForMember = await Deal.find(withStageType(memberScope, stageOrs, 'won'))
+        .select('value createdAt wonAt');
       const revenue = wonDealsForMember.reduce((s, d) => s + (d.value || 0), 0);
 
-      // Average cycle time (created → won) in days
       let avgCycleTime = 0;
       const dealsWithCycle = wonDealsForMember.filter(d => d.wonAt && d.createdAt);
       if (dealsWithCycle.length > 0) {
@@ -598,7 +1012,11 @@ router.get('/stats', protect, async (req, res) => {
       activeDeals,
       pendingTasks: tasks,
       totalRevenue,
+      // wonDeals/dealsWon/dealsLost — three keys for backwards compat. The
+      // dashboard's win-rate calculation reads dealsWon/dealsLost.
       wonDeals: wonDeals.length,
+      dealsWon: wonDeals.length,
+      dealsLost: lostDeals,
       recentDeals,
       upcomingTasks,
       pipelineStats,

@@ -6,6 +6,7 @@ import { protect, authorize } from '../middleware/auth.js';
 import { sendEmail, inviteEmail } from '../utils/email.js';
 import crypto from 'crypto';
 import { PLANS, UNLIMITED } from '../config/plans.js';
+import { sendTestEvent } from '../services/invoiceWebhook.js';
 
 // Fields on the org doc that are controlled by the user's plan, not editable directly.
 // Stripped from any PUT /organization payload so a client can't grant itself paid features.
@@ -55,8 +56,51 @@ router.put('/organization', protect, authorize('owner', 'admin'), async (req, re
     const planConfig = PLANS[req.organization?.plan] || PLANS.trial;
     if (!planConfig.webhooks) delete update.webhookUrl;
 
+    // Auto-generate the accounting webhook signing secret the first time a URL
+    // is set. Operator can rotate via /regenerate-accounting-webhook-secret.
+    if (update.preferences?.accountingWebhookUrl && !update.preferences.accountingWebhookSecret) {
+      const existing = await Organization.findById(req.organizationId)
+        .select('preferences.accountingWebhookSecret').lean();
+      if (!existing?.preferences?.accountingWebhookSecret) {
+        update.preferences.accountingWebhookSecret = 'whsec_' + crypto.randomBytes(24).toString('hex');
+      } else {
+        update.preferences.accountingWebhookSecret = existing.preferences.accountingWebhookSecret;
+      }
+    }
+
     const org = await Organization.findByIdAndUpdate(req.organizationId, update, { new: true });
     res.json(org);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Regenerate the accounting webhook signing secret. Old secret stops working
+// immediately — operator must update their receiver (n8n / QuickBooks bridge).
+router.post('/regenerate-accounting-webhook-secret', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    const newSecret = 'whsec_' + crypto.randomBytes(24).toString('hex');
+    const org = await Organization.findByIdAndUpdate(
+      req.organizationId,
+      { 'preferences.accountingWebhookSecret': newSecret },
+      { new: true }
+    );
+    res.json({ secret: org.preferences.accountingWebhookSecret });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Synchronous test ping for the accounting webhook. Doesn't write to the
+// delivery log — purely for "did I wire this up correctly?" feedback during
+// integration setup. Returns the receiver's HTTP code (or a transport error).
+router.post('/test-accounting-webhook', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    const org = await Organization.findById(req.organizationId)
+      .select('name preferences.accountingWebhookUrl preferences.accountingWebhookSecret')
+      .lean();
+    const result = await sendTestEvent(org);
+    res.json(result);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -154,6 +198,27 @@ router.post('/team/invite', protect, authorize('owner', 'admin'), async (req, re
 router.put('/team/:id', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     const { role, isActive } = req.body;
+
+    const target = await User.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!target) return res.status(404).json({ message: 'User not found' });
+
+    // Admins cannot edit the owner.
+    if (target.role === 'owner' && req.user.role !== 'owner') {
+      return res.status(403).json({ message: 'Only the owner can change owner settings' });
+    }
+    // Only the owner can transfer ownership.
+    if (role === 'owner' && req.user.role !== 'owner') {
+      return res.status(403).json({ message: 'Only the owner can transfer ownership' });
+    }
+    // Owner cannot demote themselves — they'd lose billing access. Transfer ownership first.
+    if (
+      target._id.toString() === req.user._id.toString() &&
+      req.user.role === 'owner' &&
+      role && role !== 'owner'
+    ) {
+      return res.status(400).json({ message: 'Owner cannot demote themselves. Transfer ownership first.' });
+    }
+
     const update = {};
     if (role) update.role = role;
     if (typeof isActive === 'boolean') update.isActive = isActive;
@@ -164,7 +229,6 @@ router.put('/team/:id', protect, authorize('owner', 'admin'), async (req, res) =
       { new: true }
     ).select('-password');
 
-    if (!user) return res.status(404).json({ message: 'User not found' });
     res.json(user);
   } catch (error) {
     res.status(500).json({ message: error.message });

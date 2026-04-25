@@ -34,7 +34,7 @@ router.get('/:id', protect, async (req, res) => {
 });
 
 // CREATE — from template or custom
-router.post('/', protect, async (req, res) => {
+router.post('/', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     const { templateId, ...body } = req.body;
     let automationData = { ...body, organization: req.organizationId, createdBy: req.user._id };
@@ -62,7 +62,7 @@ router.post('/', protect, async (req, res) => {
 });
 
 // UPDATE
-router.put('/:id', protect, async (req, res) => {
+router.put('/:id', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     const automation = await Automation.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -77,7 +77,7 @@ router.put('/:id', protect, async (req, res) => {
 });
 
 // TOGGLE active/inactive
-router.patch('/:id/toggle', protect, async (req, res) => {
+router.patch('/:id/toggle', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     const automation = await Automation.findOne({ _id: req.params.id, organization: req.organizationId });
     if (!automation) return res.status(404).json({ message: 'Not found' });
@@ -90,7 +90,7 @@ router.patch('/:id/toggle', protect, async (req, res) => {
 });
 
 // DELETE
-router.delete('/:id', protect, async (req, res) => {
+router.delete('/:id', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
     await Automation.findOneAndDelete({ _id: req.params.id, organization: req.organizationId });
     res.json({ message: 'Deleted' });
