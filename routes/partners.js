@@ -9,6 +9,8 @@ import Package from '../models/Package.js';
 import { protect } from '../middleware/auth.js';
 import { requirePartnerQuota, enforceImageCap, enforceCsvRowCap } from '../middleware/partnerQuota.js';
 import { priceStay } from '../services/rateResolver.js';
+import { priceActivity } from '../services/activityPricer.js';
+import { priceTransport } from '../services/transportPricer.js';
 import { checkAiCredits } from '../middleware/subscription.js';
 import { logAiCall } from '../utils/aiLogger.js';
 import { AI_CREDIT_COST } from '../config/plans.js';
@@ -475,6 +477,32 @@ router.put('/transport/:id', protect, enforceImageCap, async (req, res) => {
   }
 });
 
+// Price a transport for a quote: applies the pricingModel + FX. Mirrors
+// /activities/:id/price so the client can snapshot FX context onto the day.
+router.post('/transport/:id/price', protect, async (req, res) => {
+  try {
+    const transport = await Transport.findOne({ _id: req.params.id, organization: req.organizationId }).lean();
+    if (!transport) return res.status(404).json({ message: 'Transport not found' });
+
+    const { adults = 0, children = 0, days = 1, distanceKm = 0, quoteCurrency } = req.body;
+    const effectiveCurrency = quoteCurrency || req.organization?.defaults?.currency || 'USD';
+    const orgFxOverrides = req.organization?.fxRates || {};
+
+    const priced = priceTransport(transport, {
+      adults,
+      children,
+      days,
+      distanceKm,
+      quoteCurrency: effectiveCurrency,
+      orgFxOverrides,
+    });
+
+    res.json({ ok: true, ...priced });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 router.delete('/transport/:id', protect, async (req, res) => {
   try {
     await Transport.findOneAndUpdate(
@@ -532,6 +560,33 @@ router.delete('/activities/:id', protect, async (req, res) => {
       { isActive: false }
     );
     res.json({ message: 'Deleted' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Price an activity for a quote: applies the activity's pricingModel and
+// converts from the activity's source currency into the quote's currency
+// using the org's FX overrides. Mirrors /hotels/:id/price-stay so the client
+// can snapshot FX context onto the day.activities[] entry.
+router.post('/activities/:id/price', protect, async (req, res) => {
+  try {
+    const activity = await Activity.findOne({ _id: req.params.id, organization: req.organizationId }).lean();
+    if (!activity) return res.status(404).json({ message: 'Activity not found' });
+
+    const { adults = 0, children = 0, childAges = [], quoteCurrency } = req.body;
+    const effectiveCurrency = quoteCurrency || req.organization?.defaults?.currency || 'USD';
+    const orgFxOverrides = req.organization?.fxRates || {};
+
+    const priced = priceActivity(activity, {
+      adults,
+      children,
+      childAges,
+      quoteCurrency: effectiveCurrency,
+      orgFxOverrides,
+    });
+
+    res.json({ ok: true, ...priced });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -769,10 +824,57 @@ router.post('/packages/:id/price', protect, async (req, res) => {
     const subtotalSource = adultTotal + singleSupplement + childTotal;
     const fxRate = getFxRate(pricing.currency, effectiveCurrency, orgFxOverrides) ?? 1;
 
+    // Hydrate segment hotels — segment.hotel is just an ObjectId ref. Without
+    // this the client builds package days with empty descriptions/images even
+    // when the linked Hotel doc has full info. One bulk lookup so we don't
+    // N+1 across 5–10 segment camps.
+    const segmentHotelIds = (pkg.segments || [])
+      .map(s => s.hotel)
+      .filter(Boolean)
+      .map(id => String(id));
+    const hotelDocs = segmentHotelIds.length
+      ? await Hotel.find({ _id: { $in: segmentHotelIds }, organization: req.organizationId })
+          .select('name description images location destination type stars amenities contactEmail contactPhone coordinates tags')
+          .lean()
+      : [];
+    const hotelById = new Map(hotelDocs.map(h => [String(h._id), h]));
+    const populatedSegments = (pkg.segments || []).map(seg => {
+      const linked = seg.hotel ? hotelById.get(String(seg.hotel)) : null;
+      return {
+        startDay: seg.startDay,
+        endDay: seg.endDay,
+        location: seg.location,
+        notes: seg.notes,
+        // Carry the ref id alongside the resolved doc so the client can use
+        // it for follow-on actions (e.g. opening the hotel partner page).
+        hotelId: linked ? linked._id : seg.hotel || null,
+        hotelName: linked?.name || seg.hotelName || '',
+        hotel: linked || null,
+      };
+    });
+
     res.json({
       ok: true,
-      package: { _id: pkg._id, name: pkg.name, durationNights: pkg.durationNights, durationDays: pkg.durationDays },
-      pricingList: { _id: pricing._id, name: pricing.name, audience: pricing.audience, priority: pricing.priority, mealPlan: pricing.mealPlan },
+      package: {
+        _id: pkg._id,
+        name: pkg.name,
+        description: pkg.description || '',
+        durationNights: pkg.durationNights,
+        durationDays: pkg.durationDays,
+        images: pkg.images || [],
+        tags: pkg.tags || [],
+        notes: pkg.notes || '',
+      },
+      pricingList: {
+        _id: pricing._id,
+        name: pricing.name,
+        audience: pricing.audience,
+        priority: pricing.priority,
+        mealPlan: pricing.mealPlan,
+        mealPlanLabel: pricing.mealPlanLabel || '',
+        seasonLabel: pricing.seasonLabel || '',
+        notes: pricing.notes || '',
+      },
       tier,
       adults,
       childAges,
@@ -787,7 +889,7 @@ router.post('/packages/:id/price', protect, async (req, res) => {
       subtotalInQuoteCurrency: subtotalSource * fxRate,
       inclusions: pricing.inclusions || [],
       exclusions: pricing.exclusions || [],
-      segments: pkg.segments || [],
+      segments: populatedSegments,
       cancellationTiers: pkg.cancellationTiers || [],
       depositPct: pkg.depositPct || 0,
       bookingTerms: pkg.bookingTerms || '',

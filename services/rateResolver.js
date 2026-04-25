@@ -457,20 +457,57 @@ export function priceStay({
     }
   });
 
+  // Mandatory add-ons that recur per night (resort fees, conservancy access,
+  // mandatory tip pools). Trip-level mandatory units (per_person, per_trip)
+  // can't fit a per-night roll-up cleanly — those are flagged so the operator
+  // line-items them. Optional add-ons stay in the showcase only.
+  const totalPaxForAddOns = (Number(pax.adults) || 0) + ((pax.childAges || []).length);
+  const roomCount = roomSlots.length;
+  const mandatoryNightlyBreakdown = [];
+  const skippedTripLevelMandatory = [];
+  for (const a of (rateList.addOns || [])) {
+    if (a.optional !== false) continue; // optional → showcase only
+    const addonCurrency = a.currency || rateList.currency;
+    const amountInSource = addonCurrency === rateList.currency
+      ? Number(a.amount) || 0
+      : convert(Number(a.amount) || 0, addonCurrency, rateList.currency, orgFxOverrides);
+    let perNight = 0;
+    switch (a.unit) {
+      case 'per_person_per_day': perNight = amountInSource * totalPaxForAddOns; break;
+      case 'per_room_per_day':   perNight = amountInSource * roomCount; break;
+      case 'per_day':            perNight = amountInSource; break;
+      // per_person, per_trip, per_vehicle: trip-level — surface as warning
+      // and let the operator line-item them. Surfacing the per-trip math
+      // here would be wrong because we don't always know the full stay.
+      default:
+        skippedTripLevelMandatory.push({ name: a.name, unit: a.unit, amount: a.amount, currency: addonCurrency });
+        continue;
+    }
+    if (perNight > 0) {
+      mandatoryNightlyBreakdown.push({ name: a.name, unit: a.unit, amount: perNight, currency: rateList.currency });
+    }
+  }
+  const mandatoryNightlyTotal = mandatoryNightlyBreakdown.reduce((s, x) => s + x.amount, 0);
+  if (skippedTripLevelMandatory.length) {
+    warnings.push(
+      `Mandatory add-ons with trip-level units skipped from auto-roll-up (line-item them): ${skippedTripLevelMandatory.map(x => `${x.name} (${x.unit})`).join(', ')}.`
+    );
+  }
+
   // Per-night pricing
   const nightly = [];
   for (const date of nights) {
     const season = findSeasonForNight(rateList.seasons, date);
     if (!season) {
       warnings.push(`No season covers ${date.toISOString().slice(0, 10)} — this night skipped.`);
-      nightly.push({ date, season: null, roomType: null, base: 0, supplements: [], total: 0 });
+      nightly.push({ date, season: null, roomType: null, base: 0, supplements: [], mandatoryAddOns: 0, total: 0 });
       continue;
     }
 
     const baseRoomPricing = pickRoomPricing(season, preferredRoomType);
     if (!baseRoomPricing) {
       warnings.push(`Season ${season.label} has no room pricing — this night skipped.`);
-      nightly.push({ date, season: season.label, roomType: null, base: 0, supplements: [], total: 0 });
+      nightly.push({ date, season: season.label, roomType: null, base: 0, supplements: [], mandatoryAddOns: 0, total: 0 });
       continue;
     }
     // Apply length-of-stay tier based on the total stay length (not per-night).
@@ -494,7 +531,8 @@ export function priceStay({
       base: nightBase,
       breakdown,
       supplements: sups,
-      total: nightBase + sumSups,
+      mandatoryAddOns: mandatoryNightlyTotal,
+      total: nightBase + sumSups + mandatoryNightlyTotal,
     });
   }
 
@@ -529,7 +567,24 @@ export function priceStay({
 
   return {
     ok: true,
-    hotel: { _id: hotel._id, name: hotel.name, destination: hotel.destination },
+    // Hotel-level display fields. The client snapshots these onto the day so
+    // the share page / PDF can render rich detail (stars, type, sub-location,
+    // amenities, contact, coordinates) without re-fetching the partner doc.
+    hotel: {
+      _id: hotel._id,
+      name: hotel.name,
+      description: hotel.description,
+      images: hotel.images,
+      destination: hotel.destination,
+      location: hotel.location,
+      type: hotel.type,
+      stars: hotel.stars,
+      amenities: hotel.amenities,
+      coordinates: hotel.coordinates,
+      contactEmail: hotel.contactEmail,
+      contactPhone: hotel.contactPhone,
+      tags: hotel.tags,
+    },
     rateList: {
       _id: rateList._id,
       name: rateList.name,
@@ -550,6 +605,14 @@ export function priceStay({
     fxRate,
     passThroughFees: ptFeesConverted,
     addOns,
+    // Mandatory add-ons that recur per night are already included in each
+    // night.total above and therefore in subtotalSource. Surfaced here so the
+    // operator UI can attribute the cost ("includes resort fees & conservancy
+    // access") without having to recompute. Trip-level mandatory units (per
+    // person, per trip, per vehicle) are NOT auto-rolled — those are flagged
+    // in `warnings` and remain in `addOns` for the operator to line-item.
+    mandatoryAddOnsPerNight: mandatoryNightlyBreakdown,
+    mandatoryAddOnsPerNightTotal: mandatoryNightlyTotal,
     cancellationTiers: rateList.cancellationTiers || [],
     depositPct: rateList.depositPct || 0,
     bookingTerms: rateList.bookingTerms || '',

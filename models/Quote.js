@@ -96,12 +96,13 @@ const quoteSchema = new mongoose.Schema({
       { id: 'day_by_day', enabled: true, order: 2 },
       { id: 'map', enabled: true, order: 3 },
       { id: 'accommodations', enabled: true, order: 4 },
-      { id: 'pricing', enabled: true, order: 5 },
-      { id: 'inclusions', enabled: true, order: 6 },
-      { id: 'exclusions', enabled: true, order: 7 },
-      { id: 'payment_terms', enabled: true, order: 8 },
-      { id: 'about_us', enabled: false, order: 9 },
-      { id: 'terms', enabled: false, order: 10 },
+      { id: 'optional_extras', enabled: true, order: 5 },
+      { id: 'pricing', enabled: true, order: 6 },
+      { id: 'inclusions', enabled: true, order: 7 },
+      { id: 'exclusions', enabled: true, order: 8 },
+      { id: 'payment_terms', enabled: true, order: 9 },
+      { id: 'about_us', enabled: false, order: 10 },
+      { id: 'terms', enabled: false, order: 11 },
     ],
   },
   
@@ -135,6 +136,14 @@ const quoteSchema = new mongoose.Schema({
   inclusions: [String],
   exclusions: [String],
   paymentTerms: { type: String, default: '' },
+
+  // Package snapshot — populated when the quote was built from a Package
+  // (multi-camp trail). Carries the package-level metadata that doesn't
+  // belong on a single day: pax tier used, single supplement, child
+  // breakdown, cancellation policy, deposit, booking terms, mealPlan, and
+  // source/quote-currency context. Surfaced by the Payment Terms / policy
+  // blocks on the share page (Chunk 6 wiring).
+  packageSnapshot: { type: mongoose.Schema.Types.Mixed, default: null },
   
   // Shareable link
   shareToken: { type: String, unique: true, sparse: true },

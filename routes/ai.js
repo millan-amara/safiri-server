@@ -323,6 +323,7 @@ router.post('/draft-itinerary', heavy, logAiCall('draft-itinerary'), async (req,
     const Activity = (await import('../models/Activity.js')).default;
     const Destination = (await import('../models/Destination.js')).default;
     const { priceStay, summarizeCheapestRate } = await import('../services/rateResolver.js');
+    const { priceActivity } = await import('../services/activityPricer.js');
 
     const effectiveCurrency = quoteCurrency || req.organization?.defaults?.currency || 'USD';
     const orgFxOverrides = req.organization?.fxRates || {};
@@ -388,12 +389,12 @@ Respond ONLY with JSON: { "destinations": ["ExactName1", "ExactName2"] }`;
     }
 
     const hotels = await Hotel.find(hotelFilter)
-      .select('name destination type description rateLists currency images')
+      .select('name destination type description rateLists currency images location stars amenities coordinates contactEmail contactPhone tags')
       .sort({ updatedAt: -1 })
       .limit(MAX_CATALOG_PER_TYPE)
       .lean();
     const activities = await Activity.find(activityFilter)
-      .select('name destination description costPerPerson groupRate')
+      .select('name destination description costPerPerson groupRate pricingModel currency images duration minimumAge maxGroupSize season tags commissionRate notes isOptional')
       .sort({ updatedAt: -1 })
       .limit(MAX_CATALOG_PER_TYPE)
       .lean();
@@ -505,6 +506,15 @@ Generate the full itinerary as JSON.`;
               name: found.name,
               images: found.images || [],
               description: found.description || '',
+              // Hotel-level display fields (mirrors selectHotelForDay snapshot)
+              location: found.location || '',
+              type: found.type || '',
+              stars: found.stars || null,
+              amenities: found.amenities || [],
+              coordinates: found.coordinates || null,
+              contactEmail: found.contactEmail || '',
+              contactPhone: found.contactPhone || '',
+              tags: found.tags || [],
               // Rate list snapshot
               rateListId: priced.rateList._id,
               rateListName: priced.rateList.name,
@@ -516,14 +526,20 @@ Generate the full itinerary as JSON.`;
               // Per-night rollup
               roomType: priced.roomType,
               seasonLabel: night.season,
+              // night.total includes per-night mandatory add-ons rolled in
+              // by the resolver (resort fees, conservancy access, etc.).
               ratePerNight: night.total || 0,                              // source currency
               ratePerNightInQuoteCurrency: (night.total || 0) * priced.fxRate,
               supplements: night.supplements || [],
               // Surfaced but not added to nightly cost — caller can itemize
               passThroughFees: priced.passThroughFees,
               addOns: priced.addOns,
+              mandatoryAddOnsPerNight: priced.mandatoryAddOnsPerNight || [],
+              mandatoryAddOnsPerNightTotal: priced.mandatoryAddOnsPerNightTotal || 0,
               cancellationTiers: priced.cancellationTiers,
               depositPct: priced.depositPct,
+              bookingTerms: priced.bookingTerms || '',
+              rateListNotes: priced.notes || '',
               inclusions: priced.inclusions || [],
               exclusions: priced.exclusions || [],
               warnings: priced.warnings,
@@ -536,6 +552,14 @@ Generate the full itinerary as JSON.`;
               name: found.name,
               images: found.images || [],
               description: found.description || '',
+              location: found.location || '',
+              type: found.type || '',
+              stars: found.stars || null,
+              amenities: found.amenities || [],
+              coordinates: found.coordinates || null,
+              contactEmail: found.contactEmail || '',
+              contactPhone: found.contactPhone || '',
+              tags: found.tags || [],
               ratePerNight: 0,
               ratePerNightInQuoteCurrency: 0,
               sourceCurrency: found.currency || effectiveCurrency,
@@ -548,21 +572,42 @@ Generate the full itinerary as JSON.`;
       const dayActivities = (day.suggestedActivities || []).map(name => {
         const found = activities.find(a => a.name === name);
         if (!found) return null;
-        const totalPax = effectiveAdults + (childAges?.length || 0);
-        const totalCost = found.costPerPerson ? found.costPerPerson * totalPax : (found.groupRate || 0);
+        const priced = priceActivity(found, {
+          adults: effectiveAdults,
+          children: (childAges || []).length,
+          childAges: childAges || [],
+          quoteCurrency: effectiveCurrency,
+          orgFxOverrides,
+        });
         return {
           activityId: found._id,
           name: found.name,
+          description: found.description,
+          // Pricing context (Chunk 1)
           costPerPerson: found.costPerPerson,
           groupRate: found.groupRate,
-          totalCost,
-          isOptional: false,
-          description: found.description,
+          pricingModel: priced.pricingModel,
+          sourceCurrency: priced.sourceCurrency,
+          fxRate: priced.fxRate,
+          totalCost: priced.totalCost,
+          totalCostInQuoteCurrency: priced.totalCostInQuoteCurrency,
+          warnings: priced.warnings,
+          // Display + constraint context (Chunk 4)
+          images: found.images || [],
+          duration: found.duration || 0,
+          destination: found.destination || '',
+          minimumAge: found.minimumAge || 0,
+          maxGroupSize: found.maxGroupSize || 0,
+          season: found.season || 'all',
+          tags: found.tags || [],
+          commissionRate: found.commissionRate || 0,
+          notes: found.notes || '',
+          isOptional: !!found.isOptional,
         };
       }).filter(Boolean);
 
       const hotelCost = hotel?.ratePerNightInQuoteCurrency || hotel?.ratePerNight || 0;
-      const actCost = dayActivities.reduce((s, a) => s + (a.totalCost || 0), 0);
+      const actCost = dayActivities.reduce((s, a) => s + (a.totalCostInQuoteCurrency ?? a.totalCost ?? 0), 0);
 
       return {
         dayNumber: i + 1,
