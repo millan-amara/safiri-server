@@ -113,6 +113,12 @@ const start = async () => {
           await db.collection('quotes').dropIndex(idx.name);
           console.log(`Dropped stale index: ${idx.name}`);
         }
+        // Legacy global unique index on quoteNumber — replaced by a per-org compound index.
+        // Without this drop, two different orgs can't have the same quoteNumber (e.g. "2026-0001").
+        if (idx.name === 'quoteNumber_1') {
+          await db.collection('quotes').dropIndex(idx.name);
+          console.log('Dropped legacy global quoteNumber_1 index (now per-org)');
+        }
       }
     }
 

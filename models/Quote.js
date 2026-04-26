@@ -41,8 +41,9 @@ const daySchema = new mongoose.Schema({
 const quoteSchema = new mongoose.Schema({
   organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', required: true },
   
-  // Reference
-  quoteNumber: { type: String, unique: true, sparse: true },
+  // Reference — uniqueness is enforced per-organization via a compound index below,
+  // not globally, so two orgs can both have "2026-0001".
+  quoteNumber: { type: String },
   version: { type: Number, default: 1 },
   parentQuote: { type: mongoose.Schema.Types.ObjectId, ref: 'Quote' },  // For versioning
   
@@ -199,12 +200,23 @@ const quoteSchema = new mongoose.Schema({
   },
 }, { timestamps: true });
 
-// Auto-generate quote number and share token
+// Auto-generate quote number and share token.
+// The number resets every calendar year and is scoped per-organization.
+// We pick the next number from the *max* existing number for this org+year
+// (not a count) so deleting a quote doesn't cause the next save to collide.
 quoteSchema.pre('save', async function() {
   if (!this.quoteNumber) {
     const year = new Date().getFullYear();
-    const count = await this.constructor.countDocuments({ organization: this.organization });
-    this.quoteNumber = `${year}-${String(count + 1).padStart(4, '0')}`;
+    const last = await this.constructor.findOne({
+      organization: this.organization,
+      quoteNumber: { $regex: `^${year}-` },
+    }).sort({ quoteNumber: -1 }).select('quoteNumber').lean();
+    let next = 1;
+    if (last?.quoteNumber) {
+      const n = parseInt(last.quoteNumber.split('-')[1], 10);
+      if (Number.isFinite(n)) next = n + 1;
+    }
+    this.quoteNumber = `${year}-${String(next).padStart(4, '0')}`;
   }
   if (!this.shareToken) {
     this.shareToken = nanoid(12);
@@ -213,5 +225,7 @@ quoteSchema.pre('save', async function() {
 
 quoteSchema.index({ organization: 1 });
 quoteSchema.index({ organization: 1, deal: 1 });
+// Per-org uniqueness on quoteNumber. Sparse so quotes without a number (rare) don't collide.
+quoteSchema.index({ organization: 1, quoteNumber: 1 }, { unique: true, sparse: true });
 
 export default mongoose.model('Quote', quoteSchema);
