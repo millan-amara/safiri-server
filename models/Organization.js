@@ -70,6 +70,12 @@ const organizationSchema = new mongoose.Schema({
     // (bank details, M-Pesa paybill, etc.). Snapshotted onto the invoice
     // at creation; operator can override per-invoice.
     paymentInstructions: { type: String, default: '' },
+    // Deposit/balance defaults for the "split into deposit + balance" action.
+    // Travel-ops norm: ~30% deposit due shortly after booking, balance due
+    // ~60 days before travel. Operator can override at split time.
+    depositPercent: { type: Number, default: 30, min: 0, max: 100 },
+    depositDueDays: { type: Number, default: 7, min: 0 },
+    balanceDaysBeforeTravel: { type: Number, default: 60, min: 0 },
     // External accounting webhook — fires JSON payloads on invoice lifecycle
     // events (created, sent, paid, cancelled) so QuickBooks/Xero/n8n/Zapier
     // can react. Separate from the n8n `webhookUrl` field above (general CRM

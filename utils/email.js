@@ -15,6 +15,28 @@ function getClient() {
 const APP_NAME = process.env.APP_NAME || 'SafiriPro';
 const DEFAULT_FROM = process.env.EMAIL_FROM || `${APP_NAME} <noreply@azayon.com>`;
 
+// Pull the bare address out of DEFAULT_FROM so we can rebuild From with a
+// custom display name (operator + org) without losing the configured sender
+// address. Accepts either "Name <addr>" or just "addr".
+const FROM_ADDRESS = (DEFAULT_FROM.match(/<([^>]+)>/)?.[1] || DEFAULT_FROM).trim();
+
+// Quote-escape a display name per RFC 5322 quoted-string rules. Names with
+// commas, parens, or em dashes are common (operator org names like
+// "Smith, Jones & Co.") and would otherwise break the From parser.
+const escapeDisplayName = (s) => String(s).replace(/[\\"]/g, '\\$&');
+
+// Build a "${operator} at ${org}" display name, falling back gracefully when
+// either is missing. Returns null when both are empty so the caller can let
+// sendEmail fall back to DEFAULT_FROM. Used by routes that send on behalf of
+// a specific operator (voucher email, templated email) — NOT by system
+// transactional mail (verify/invite/reset), which keeps the SafiriPro brand.
+export function operatorSenderName({ user, org }) {
+  const u = (user?.name || '').trim();
+  const o = (org?.name || '').trim();
+  if (u && o) return `${u} at ${o}`;
+  return u || o || null;
+}
+
 // HTML-escape any user-controlled value before interpolating into a template.
 // Without this, an attacker who can set inviterName / userName / orgName (e.g.
 // during registration) could inject anchor/script tags that hijack the
@@ -28,24 +50,48 @@ const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
 // the markup.
 const escapeAttr = (s) => String(s ?? '').replace(/["']/g, (c) => ({ '"': '&quot;', "'": '&#39;' }[c]));
 
-export async function sendEmail({ to, subject, html, from }) {
+// `attachments` follows Resend's shape: [{ filename, content: Buffer, contentType? }].
+// `replyTo` is a single address string — when set, replies route there instead
+// of to DEFAULT_FROM (which is a noreply mailbox).
+// `senderName` (optional) overrides the From display name while keeping the
+// configured FROM_ADDRESS — used to send "Sara at Kenya Safari Co." from the
+// shared azayon.com mailbox so the recipient sees the operator's brand, not
+// the SaaS brand. Ignored when `from` is explicitly passed.
+export async function sendEmail({ to, subject, html, from, attachments, replyTo, senderName }) {
   const client = getClient();
+
+  // Compose the From header. Explicit `from` wins; otherwise senderName builds
+  // "Name <addr>"; otherwise DEFAULT_FROM.
+  const fromHeader = from
+    || (senderName ? `"${escapeDisplayName(senderName)}" <${FROM_ADDRESS}>` : DEFAULT_FROM);
 
   if (!client) {
     console.log('─── EMAIL (not sent, Resend not configured) ───');
+    console.log(`From: ${fromHeader}`);
     console.log(`To: ${to}`);
     console.log(`Subject: ${subject}`);
     console.log(`Body: ${html.substring(0, 200)}...`);
+    if (attachments?.length) console.log(`Attachments: ${attachments.map(a => a.filename).join(', ')}`);
     console.log('────────────────────────────────────────────────');
     return;
   }
 
-  const { error } = await client.emails.send({
-    from: from || DEFAULT_FROM,
+  const payload = {
+    from: fromHeader,
     to,
     subject,
     html,
-  });
+  };
+  if (replyTo) payload.replyTo = replyTo;
+  if (attachments?.length) {
+    payload.attachments = attachments.map(a => ({
+      filename: a.filename,
+      content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : a.content,
+      contentType: a.contentType,
+    }));
+  }
+
+  const { error } = await client.emails.send(payload);
 
   if (error) {
     console.error('Resend error:', error);
@@ -175,4 +221,58 @@ export function verifyEmailTemplate({ userName, verifyUrl }) {
       You can use ${safeAppName} without verifying, but you may miss email notifications.
     </p>
   `);
+}
+
+export function invoiceEmail({ clientName, invoiceNumber, total, currency, dueDate, paymentInstructions, orgName, message, type }) {
+  const safeName = escapeHtml(clientName || 'there');
+  const safeNum = escapeHtml(invoiceNumber);
+  const safeAmount = `${escapeHtml(currency || 'USD')} ${Number(total || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const dateStr = (d) => d ? new Date(d).toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' }) : '';
+  const typeLabel = type === 'deposit' ? 'deposit invoice'
+    : type === 'balance' ? 'balance invoice'
+    : 'invoice';
+  const safeMessage = message ? escapeHtml(message).replace(/\n/g, '<br/>') : '';
+  const safePay = paymentInstructions ? escapeHtml(paymentInstructions).replace(/\n/g, '<br/>') : '';
+  return wrap(`
+    <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">Your ${typeLabel} is attached</h3>
+    <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">
+      Hi ${safeName}, please find attached ${escapeHtml(typeLabel)} <strong style="color: ${COLORS.text};">${safeNum}</strong>.
+    </p>
+    <div style="margin: 24px 0; padding: 16px; background: ${COLORS.bg}; border-radius: 8px;">
+      <p style="margin: 0; color: ${COLORS.text}; font-size: 14px;"><strong>Amount due:</strong> ${safeAmount}</p>
+      ${dueDate ? `<p style="margin: 6px 0 0; color: ${COLORS.text}; font-size: 14px;"><strong>Due:</strong> ${escapeHtml(dateStr(dueDate))}</p>` : ''}
+    </div>
+    ${safeMessage ? `<p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">${safeMessage}</p>` : ''}
+    ${safePay ? `
+      <div style="margin: 16px 0; padding: 12px; border-left: 3px solid ${COLORS.primary}; background: ${COLORS.bg};">
+        <p style="margin: 0 0 6px; color: ${COLORS.subtle}; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;">Payment instructions</p>
+        <p style="margin: 0; color: ${COLORS.text}; font-size: 13px; line-height: 1.5;">${safePay}</p>
+      </div>
+    ` : ''}
+    <p style="color: ${COLORS.subtle}; font-size: 12px;">
+      Reply to this email if you have any questions about this ${escapeHtml(typeLabel)}.
+    </p>
+  `, orgName);
+}
+
+export function voucherEmail({ guestName, hotelName, checkIn, checkOut, voucherNumber, orgName, message }) {
+  const safeGuest = escapeHtml(guestName || 'there');
+  const safeHotel = escapeHtml(hotelName || 'your accommodation');
+  const safeNum = escapeHtml(voucherNumber);
+  const dateStr = (d) => d ? new Date(d).toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' }) : '';
+  const safeMessage = message ? escapeHtml(message).replace(/\n/g, '<br/>') : '';
+  return wrap(`
+    <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">Your hotel voucher is ready</h3>
+    <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">
+      Hi ${safeGuest}, please find attached your voucher (${safeNum}) for <strong style="color: ${COLORS.text};">${safeHotel}</strong>.
+    </p>
+    <div style="margin: 24px 0; padding: 16px; background: ${COLORS.bg}; border-radius: 8px;">
+      <p style="margin: 0; color: ${COLORS.text}; font-size: 14px;"><strong>Check-in:</strong> ${escapeHtml(dateStr(checkIn))}</p>
+      <p style="margin: 6px 0 0; color: ${COLORS.text}; font-size: 14px;"><strong>Check-out:</strong> ${escapeHtml(dateStr(checkOut))}</p>
+    </div>
+    ${safeMessage ? `<p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">${safeMessage}</p>` : ''}
+    <p style="color: ${COLORS.subtle}; font-size: 12px;">
+      Please present the attached voucher at check-in. Reply to this email if you have any questions.
+    </p>
+  `, orgName);
 }

@@ -211,8 +211,17 @@ router.put('/:id', protect, authorize('owner', 'admin', 'agent'), async (req, re
       if (req.body[f] !== undefined) body[f] = req.body[f];
     }
     if (body.days) body.days = sanitizeDays(body.days);
-    if (body.contact === '' || body.contact === null) body.contact = undefined;
-    if (body.deal === '' || body.deal === null) body.deal = undefined;
+
+    // Build $set + $unset. Setting a ref field to undefined here would be
+    // silently dropped by mongoose, so the operator's "clear this link" never
+    // actually clears it. Use $unset for empty values instead.
+    const unsetOps = {};
+    for (const f of ['contact', 'deal']) {
+      if (body[f] === '' || body[f] === null) {
+        delete body[f];
+        unsetOps[f] = '';
+      }
+    }
 
     const prior = await Quote.findOne({ _id: req.params.id, organization: req.organizationId }).select('status deal contact').lean();
     if (!prior) return res.status(404).json({ message: 'Not found' });
@@ -223,9 +232,12 @@ router.put('/:id', protect, authorize('owner', 'admin', 'agent'), async (req, re
     if (body.deal && String(body.deal) !== String(prior.deal || '') && !(await canLinkToDeal(req.user, body.deal))) {
       return res.status(403).json({ message: 'No access to the target deal' });
     }
+    const update = Object.keys(unsetOps).length
+      ? { $set: body, $unset: unsetOps }
+      : body;
     const quote = await Quote.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
-      body,
+      update,
       { new: true }
     );
     if (!quote) return res.status(404).json({ message: 'Not found' });

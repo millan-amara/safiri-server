@@ -86,3 +86,101 @@ export async function buildInvoicePayloadFromDeal({ deal, org, taxPercentOverrid
     paymentInstructions: org?.preferences?.paymentInstructions || '',
   };
 }
+
+// Build a deposit + balance pair from a deal. Reuses buildInvoicePayloadFromDeal
+// to get the base totals/currency/client snapshot, then derives two payloads
+// with adjusted line items, due dates, and the `type` flag set.
+//
+// `depositPercent` (0–100) is the deposit's share. The balance is the remainder.
+// Tax is split proportionally — we don't try to charge full tax on each invoice
+// or the operator would over-collect on the deposit.
+//
+// Due dates: deposit defaults to today + org.preferences.depositDueDays.
+// Balance defaults to deal.travelDates.start - org.preferences.balanceDaysBeforeTravel,
+// clamped to today + 30 days when travel is unset or the math lands in the past.
+export async function buildDepositBalancePayloadsFromDeal({
+  deal, org,
+  depositPercent,
+  depositDueDays: depositDueDaysOverride,
+  balanceDaysBeforeTravel: balanceLeadDaysOverride,
+  taxPercentOverride,
+}) {
+  const base = await buildInvoicePayloadFromDeal({ deal, org, taxPercentOverride });
+
+  const pct = Math.max(0, Math.min(100, Number(depositPercent ?? org?.preferences?.depositPercent ?? 30)));
+  const depositShare = pct / 100;
+
+  // Round to 2 decimals on the deposit, give the balance whatever's left so
+  // deposit + balance == total exactly (no rounding loss on either side).
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const depositSubtotal = round2(base.subtotal * depositShare);
+  const balanceSubtotal = round2(base.subtotal - depositSubtotal);
+  const depositTax = round2(base.taxAmount * depositShare);
+  const balanceTax = round2(base.taxAmount - depositTax);
+
+  const today = new Date();
+  // Per-call overrides win; otherwise fall back to org preferences; otherwise
+  // hardcoded defaults. `?? null` — not `||` — because 0 is a meaningful value
+  // (operator might want "deposit due today").
+  const depositDueDays = Math.max(0, Number(
+    depositDueDaysOverride ?? org?.preferences?.depositDueDays ?? 7
+  ));
+  const balanceLeadDays = Math.max(0, Number(
+    balanceLeadDaysOverride ?? org?.preferences?.balanceDaysBeforeTravel ?? 60
+  ));
+
+  const depositDue = new Date(today);
+  depositDue.setDate(depositDue.getDate() + depositDueDays);
+
+  let balanceDue;
+  if (deal.travelDates?.start) {
+    balanceDue = new Date(deal.travelDates.start);
+    balanceDue.setDate(balanceDue.getDate() - balanceLeadDays);
+    // If travel is too close (or already past), don't generate a date in the
+    // past — that misleads the client into thinking the invoice is overdue
+    // the moment they receive it.
+    const minBalanceDate = new Date(today);
+    minBalanceDate.setDate(minBalanceDate.getDate() + 30);
+    if (balanceDue < minBalanceDate) balanceDue = minBalanceDate;
+  } else {
+    balanceDue = new Date(today);
+    balanceDue.setDate(balanceDue.getDate() + 30);
+  }
+
+  const tripLabel = deal.title ? ` — ${deal.title}` : '';
+
+  const depositPayload = {
+    ...base,
+    type: 'deposit',
+    issueDate: new Date(),
+    dueDate: depositDue,
+    lineItems: [{
+      description: `Deposit (${pct}%)${tripLabel}`,
+      quantity: 1,
+      unitPrice: depositSubtotal,
+      total: depositSubtotal,
+    }],
+    subtotal: depositSubtotal,
+    taxAmount: depositTax,
+    total: depositSubtotal + depositTax,
+  };
+
+  const balancePct = Math.round((100 - pct) * 100) / 100;
+  const balancePayload = {
+    ...base,
+    type: 'balance',
+    issueDate: new Date(),
+    dueDate: balanceDue,
+    lineItems: [{
+      description: `Balance (${balancePct}%)${tripLabel}`,
+      quantity: 1,
+      unitPrice: balanceSubtotal,
+      total: balanceSubtotal,
+    }],
+    subtotal: balanceSubtotal,
+    taxAmount: balanceTax,
+    total: balanceSubtotal + balanceTax,
+  };
+
+  return { deposit: depositPayload, balance: balancePayload };
+}

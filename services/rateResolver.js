@@ -391,10 +391,18 @@ function resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, n
 
 // ─── Main entry points ────────────────────────────────────────────────
 
-// Pick the best rate list for a stay. Returns { rateList, warnings } or null.
+// Pick the best rate list for a stay. Returns { rateList, warnings, reason }.
+// `reason` is set on failure so callers can distinguish "hotel has no rate
+// lists at all" from "lists exist but none cover this stay window" — the two
+// cases need different fixes (configure rates vs. roll forward validity).
 export function pickRateList(hotel, { checkIn, checkOut, clientType = 'retail', preferredMealPlan }) {
   const warnings = [];
   const lists = (hotel.rateLists || []).filter(l => l.isActive !== false);
+
+  if (!lists.length) {
+    warnings.push('Hotel has no active rate lists.');
+    return { rateList: null, warnings, reason: 'no_active_rate_lists' };
+  }
 
   let eligible = lists.filter(l => audienceMatches(l.audience, clientType));
   if (!eligible.length) {
@@ -404,8 +412,11 @@ export function pickRateList(hotel, { checkIn, checkOut, clientType = 'retail', 
 
   const inWindow = eligible.filter(l => validityCovers(l, checkIn, checkOut));
   if (!inWindow.length) {
-    warnings.push('No rate lists cover the stay window.');
-    return { rateList: null, warnings };
+    const windows = lists
+      .map(l => `${l.name}: ${l.validFrom ? new Date(l.validFrom).toISOString().slice(0, 10) : '∞'} → ${l.validTo ? new Date(l.validTo).toISOString().slice(0, 10) : '∞'}`)
+      .join('; ');
+    warnings.push(`No rate lists cover the stay window. Configured windows — ${windows}.`);
+    return { rateList: null, warnings, reason: 'stay_window_not_covered' };
   }
 
   let byMeal = inWindow;
@@ -438,7 +449,7 @@ export function priceStay({
   warnings.push(...picked.warnings);
   const rateList = picked.rateList;
   if (!rateList) {
-    return { ok: false, warnings, reason: 'no_rate_list_available' };
+    return { ok: false, warnings, reason: picked.reason || 'no_rate_list_available' };
   }
 
   const nights = eachNight(checkIn, checkOut);

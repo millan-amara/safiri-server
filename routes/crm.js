@@ -6,6 +6,7 @@ import User from '../models/User.js';
 import Organization from '../models/Organization.js';
 import ScheduledMessage from '../models/ScheduledMessage.js';
 import Invoice from '../models/Invoice.js';
+import Quote from '../models/Quote.js';
 import { computeSendAt } from './scheduledMessages.js';
 import { buildInvoicePayloadFromDeal, nextInvoiceNumber } from '../services/invoiceBuilder.js';
 import { fireInvoiceWebhook } from '../services/invoiceWebhook.js';
@@ -297,7 +298,20 @@ router.get('/deals/:id', protect, requireDealAccess(), async (req, res) => {
       .populate('assignedTo', 'name avatar')
       .sort({ dueDate: 1 });
 
-    res.json({ deal, tasks });
+    // Quotes are queried directly. The Deal.quotes[] back-reference array
+    // exists in the schema but is never written to (each Quote keeps its own
+    // `deal` pointer as the source of truth), so populating it always returns
+    // [] and the panel looks empty even when quotes exist.
+    const quotes = await Quote.find({
+      deal: deal._id,
+      organization: req.organizationId,
+      isTemplate: { $ne: true },
+    })
+      .select('title quoteNumber status version createdAt pricing.totalPrice pricing.currency')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    res.json({ deal, tasks, quotes });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

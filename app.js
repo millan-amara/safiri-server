@@ -25,6 +25,8 @@ import onboardingRoutes from './routes/onboarding.js';
 import scheduledMessagesRoutes from './routes/scheduledMessages.js';
 import savedViewsRoutes from './routes/savedViews.js';
 import invoicesRoutes from './routes/invoices.js';
+import vouchersRoutes from './routes/vouchers.js';
+import messagesRoutes from './routes/messages.js';
 import webhookDeliveriesRoutes from './routes/webhookDeliveries.js';
 import { checkInactiveDeals, checkOverdueTasks } from './automations/engine.js';
 import { startReminderPoller } from './queues/reminderPoller.js';
@@ -122,6 +124,8 @@ app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/scheduled-messages', scheduledMessagesRoutes);
 app.use('/api/saved-views', savedViewsRoutes);
 app.use('/api/invoices', invoicesRoutes);
+app.use('/api/vouchers', vouchersRoutes);
+app.use('/api/messages', messagesRoutes);
 app.use('/api/webhook-deliveries', webhookDeliveriesRoutes);
 
 // Health check
@@ -246,6 +250,18 @@ const start = async () => {
     );
     if (invoicePrefsResult.modifiedCount > 0) {
       console.log(`Backfilled invoice preferences on ${invoicePrefsResult.modifiedCount} organizations`);
+    }
+
+    const depositPrefsResult = await Org.updateMany(
+      { 'preferences.depositPercent': { $exists: false } },
+      { $set: {
+        'preferences.depositPercent': 30,
+        'preferences.depositDueDays': 7,
+        'preferences.balanceDaysBeforeTravel': 60,
+      } }
+    );
+    if (depositPrefsResult.modifiedCount > 0) {
+      console.log(`Backfilled deposit/balance preferences on ${depositPrefsResult.modifiedCount} organizations`);
     }
 
     const webhookPrefsResult = await Org.updateMany(
