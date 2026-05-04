@@ -1,16 +1,22 @@
 import { Router } from 'express';
 import Destination from '../models/Destination.js';
-import { protect } from '../middleware/auth.js';
+import { protect, authorize } from '../middleware/auth.js';
 import { requirePartnerQuota, enforceImageCap } from '../middleware/partnerQuota.js';
 
 const router = Router();
+
+// Escape regex metachars in user-supplied strings before constructing a
+// RegExp — without this, a pattern like `(a+)+$` triggers ReDoS and stalls
+// the event loop. We only ever want substring/exact-name matching, never
+// regex semantics from the caller.
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // List destinations for this org
 router.get('/', protect, async (req, res) => {
   try {
     const { search, type } = req.query;
     const filter = { organization: req.organizationId, isActive: true };
-    if (search) filter.name = { $regex: new RegExp(search, 'i') };
+    if (search) filter.name = { $regex: new RegExp(escapeRegex(search), 'i') };
     if (type) filter.type = type;
 
     const destinations = await Destination.find(filter).sort({ name: 1 });
@@ -33,7 +39,7 @@ router.get('/:id', protect, async (req, res) => {
 });
 
 // Create
-router.post('/', protect, requirePartnerQuota('destination'), enforceImageCap, async (req, res) => {
+router.post('/', protect, authorize('owner', 'admin', 'agent'), requirePartnerQuota('destination'), enforceImageCap, async (req, res) => {
   try {
     const dest = await Destination.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(dest);
@@ -43,7 +49,7 @@ router.post('/', protect, requirePartnerQuota('destination'), enforceImageCap, a
 });
 
 // Update
-router.put('/:id', protect, enforceImageCap, async (req, res) => {
+router.put('/:id', protect, authorize('owner', 'admin', 'agent'), enforceImageCap, async (req, res) => {
   try {
     const dest = await Destination.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -58,7 +64,7 @@ router.put('/:id', protect, enforceImageCap, async (req, res) => {
 });
 
 // Add image
-router.post('/:id/images', protect, async (req, res) => {
+router.post('/:id/images', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const { url, caption, isHero, credit } = req.body;
     const dest = await Destination.findOne({ _id: req.params.id, organization: req.organizationId });
@@ -73,7 +79,7 @@ router.post('/:id/images', protect, async (req, res) => {
 });
 
 // Remove image
-router.delete('/:id/images', protect, async (req, res) => {
+router.delete('/:id/images', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     await Destination.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -90,7 +96,7 @@ router.get('/by-name/:name/images', protect, async (req, res) => {
   try {
     const dest = await Destination.findOne({
       organization: req.organizationId,
-      name: { $regex: new RegExp(req.params.name, 'i') },
+      name: { $regex: new RegExp(`^${escapeRegex(req.params.name)}$`, 'i') },
       isActive: true,
     }).select('images name');
     res.json({ images: dest?.images || [], name: dest?.name || req.params.name });

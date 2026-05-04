@@ -65,9 +65,20 @@ router.post('/contacts', async (req, res) => {
 });
 
 // PUT /api/webhooks/contacts/:id
+const ALLOWED_CONTACT_FIELDS = ['firstName', 'lastName', 'phone', 'company', 'country', 'source', 'tags', 'notes'];
 router.put('/contacts/:id', async (req, res) => {
   try {
-    const contact = await Contact.findOneAndUpdate({ _id: req.params.id, organization: req.organizationId }, { $set: req.body }, { new: true });
+    // Whitelist editable fields — never spread req.body into $set, since that
+    // lets the caller overwrite organization, _id, isActive, etc.
+    const update = {};
+    for (const k of ALLOWED_CONTACT_FIELDS) {
+      if (req.body[k] !== undefined) update[k] = req.body[k];
+    }
+    const contact = await Contact.findOneAndUpdate(
+      { _id: req.params.id, organization: req.organizationId },
+      { $set: update },
+      { new: true }
+    );
     if (!contact) return res.status(404).json({ error: 'Not found' });
     res.json({ contact });
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -91,8 +102,15 @@ router.post('/deals', async (req, res) => {
     const { title, contactId, contactEmail, stage, destination, groupSize, budget, value } = req.body;
     if (!title) return res.status(400).json({ error: 'title required' });
 
-    let contactRef = contactId;
-    if (!contactRef && contactEmail) {
+    // Resolve a contact reference. The contactId path verifies the contact
+    // belongs to the caller's org so a leaked/abused API key can't attach a
+    // foreign-tenant contact to a new deal.
+    let contactRef;
+    if (contactId) {
+      const owned = await Contact.findOne({ _id: contactId, organization: req.organizationId }).select('_id');
+      if (!owned) return res.status(400).json({ error: 'contactId not found in your organization' });
+      contactRef = owned._id;
+    } else if (contactEmail) {
       const c = await Contact.findOne({ email: contactEmail.toLowerCase(), organization: req.organizationId });
       if (c) contactRef = c._id;
     }
@@ -101,10 +119,18 @@ router.post('/deals', async (req, res) => {
     if (!pipeline) return res.status(400).json({ error: 'No pipeline configured' });
     const firstStage = pipeline.stages.sort((a, b) => a.order - b.order)[0];
 
+    // Validate the requested stage actually exists in the org's pipeline —
+    // otherwise the caller can stuff arbitrary stage strings into the deal.
+    let resolvedStage = firstStage?.name || 'New Inquiry';
+    if (stage) {
+      const match = pipeline.stages.find(s => s.name === stage);
+      if (match) resolvedStage = match.name;
+    }
+
     const deal = await Deal.create({
       organization: req.organizationId, title,
       contact: contactRef || undefined, pipeline: pipeline._id,
-      stage: stage || firstStage?.name || 'New Inquiry',
+      stage: resolvedStage,
       destination: destination || '', groupSize: groupSize || 0,
       budget: budget || 0, value: value || 0,
       activities: [{ type: 'deal_created', description: 'Created via API', createdAt: new Date() }],
@@ -115,13 +141,35 @@ router.post('/deals', async (req, res) => {
 });
 
 // POST /api/webhooks/events — fire automation trigger
+// Allowlist of events callers may trigger via API. Internal-only events
+// (e.g. quote.viewed, deal.won — which the system fires itself) are excluded
+// so an API caller can't synthesize state changes they don't actually own.
+const PUBLIC_EVENTS = new Set([
+  'contact.created',
+  'contact.updated',
+  'deal.created',
+  'deal.updated',
+]);
 router.post('/events', async (req, res) => {
   try {
     const { event, contactId, dealId, data } = req.body;
     if (!event) return res.status(400).json({ error: 'event type required' });
-    const eventData = { organizationId: req.organizationId, ...data };
-    if (contactId) eventData.contact = await Contact.findOne({ _id: contactId, organization: req.organizationId });
-    if (dealId) eventData.deal = await Deal.findOne({ _id: dealId, organization: req.organizationId });
+    if (!PUBLIC_EVENTS.has(event)) {
+      return res.status(400).json({ error: `event "${event}" is not allowed via API` });
+    }
+    // Don't spread caller-supplied data on top of organizationId — let the
+    // caller add metadata under a `data` key but never override scope fields.
+    const eventData = { organizationId: req.organizationId, data: data || {} };
+    if (contactId) {
+      const c = await Contact.findOne({ _id: contactId, organization: req.organizationId });
+      if (!c) return res.status(400).json({ error: 'contactId not found in your organization' });
+      eventData.contact = c;
+    }
+    if (dealId) {
+      const d = await Deal.findOne({ _id: dealId, organization: req.organizationId });
+      if (!d) return res.status(400).json({ error: 'dealId not found in your organization' });
+      eventData.deal = d;
+    }
     await triggerAutomation(event, eventData);
     res.json({ message: 'Event processed', event });
   } catch (error) { res.status(500).json({ error: error.message }); }

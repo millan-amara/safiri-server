@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
+import rateLimit from 'express-rate-limit';
 import connectDB from './config/db.js';
 
 import authRoutes from './routes/auth.js';
@@ -34,6 +35,13 @@ dotenv.config();
 
 const app = express();
 
+// Behind Render/Netlify the request hits a load balancer first; without
+// trust-proxy `req.ip` is always the LB's IP, which makes per-IP rate
+// limiting and the share-link viewLog useless. `1` means "trust the first
+// hop" (Render terminates TLS one hop in front of us); bump higher only if
+// you stack additional proxies.
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(helmet());
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
@@ -51,8 +59,9 @@ app.use(cors({
 // ── Paystack webhook: capture raw body BEFORE express.json() ─────────────────
 // Paystack signature verification requires the raw request body string.
 // express.raw() reads the body as a Buffer; we convert it and re-attach as req.body
-// so the billing route handler receives a normal parsed object.
-app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), (req, res, next) => {
+// so the billing route handler receives a normal parsed object. Cap at 1mb —
+// Paystack payloads are kilobytes; anything bigger is abuse.
+app.use('/api/billing/webhook', express.raw({ type: 'application/json', limit: '1mb' }), (req, res, next) => {
   if (Buffer.isBuffer(req.body)) {
     req.rawBody = req.body.toString('utf8');
     try { req.body = JSON.parse(req.rawBody); } catch { req.body = {}; }
@@ -61,10 +70,40 @@ app.use('/api/billing/webhook', express.raw({ type: 'application/json' }), (req,
 });
 
 app.use(express.json({ limit: '10mb' }));
-app.use(morgan('dev'));
+// 'dev' is colorized and concise (good for local); 'combined' is the standard
+// Apache-style log production aggregators expect. Test env stays silent.
+if (process.env.NODE_ENV !== 'test') {
+  app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+}
+
+// ── Rate limiters ───────────────────────────────────────────────────────────
+// Slow down brute-force / credential-stuffing on auth endpoints, and abuse of
+// the unauthenticated public quote-share endpoints. Applied per IP.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 min
+  max: 30,                   // 30 auth requests per IP per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests. Please slow down and try again in a few minutes.' },
+  skip: () => process.env.NODE_ENV === 'test',
+});
+
+const publicQuoteLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 min
+  max: 60,             // 60 share requests per IP per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many requests. Please slow down.' },
+  skip: () => process.env.NODE_ENV === 'test',
+});
+
+// Mount the public-quote limiter on the share path before the main quotes
+// router so unauthenticated traffic (the only thing that hits /share/*) is
+// always rate-limited regardless of router order.
+app.use('/api/quotes/share', publicQuoteLimiter);
 
 // Routes
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/partners', partnerRoutes);
 app.use('/api/crm', crmRoutes);
 app.use('/api/quotes', quoteRoutes);
@@ -88,10 +127,22 @@ app.use('/api/webhook-deliveries', webhookDeliveriesRoutes);
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
-// Error handler
+// Error handler — backstop for routes that don't catch their own errors.
+// Most routes already handle errors with explicit try/catch and return their
+// own message; this catches Express/middleware throws (multer mimetype
+// rejections, JSON parse errors, etc.).
+//
+// In production we don't echo arbitrary err.message to clients for 5xx —
+// Mongo/network errors can leak DB names, hostnames, query shapes. Client-
+// triggered 4xx errors (status set by the thrower) keep their message so
+// validation feedback still works.
 app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(err.status || 500).json({ message: err.message || 'Server error' });
+  console.error(err.stack || err);
+  const status = err.status || err.statusCode || 500;
+  if (status >= 500 && process.env.NODE_ENV === 'production') {
+    return res.status(status).json({ message: 'Server error' });
+  }
+  res.status(status).json({ message: err.message || 'Server error' });
 });
 
 const PORT = process.env.PORT || 5000;
@@ -235,6 +286,48 @@ const start = async () => {
     }
     if (stageBackfillCount > 0) {
       console.log(`Backfilled stage.type on ${stageBackfillCount} pipelines`);
+    }
+
+    // ── Credit-weight rebase (idempotent) ────────────────────────────────────
+    // Chunk 2 of the billing rework re-weighted AI credits (heavy 10→50,
+    // medium 3→5) and raised every plan's monthly allowance proportionally.
+    // For any existing org whose stored aiCreditsLimit is below the current
+    // plan's allowance, raise it now so they get the new headroom immediately
+    // instead of waiting for the next calendar-month reset. We never lower a
+    // limit (an enterprise org with a custom higher cap should keep it).
+    const { PLANS, nextMonthlyResetDate } = await import('./config/plans.js');
+    let creditLimitBumped = 0;
+    for (const [planKey, planConfig] of Object.entries(PLANS)) {
+      const result = await Org.updateMany(
+        { plan: planKey, aiCreditsLimit: { $lt: planConfig.aiCredits } },
+        { $set: { aiCreditsLimit: planConfig.aiCredits } }
+      );
+      creditLimitBumped += result.modifiedCount;
+    }
+    if (creditLimitBumped > 0) {
+      console.log(`Raised aiCreditsLimit to current plan allowance on ${creditLimitBumped} organizations`);
+    }
+
+    // ── PDF page metering seed (Chunk 4, idempotent) ─────────────────────────
+    // Backfill pdfPagesLimit + pdfPagesResetAt for orgs that existed before
+    // the field was introduced. Only sets when missing — never overrides a
+    // limit an admin (or this same backfill on a later boot) already set.
+    const pdfNextReset = nextMonthlyResetDate();
+    let pdfSeeded = 0;
+    for (const [planKey, planConfig] of Object.entries(PLANS)) {
+      if (planConfig.pdfPagesPerMonth == null) continue;
+      const result = await Org.updateMany(
+        { plan: planKey, pdfPagesLimit: { $exists: false } },
+        { $set: { pdfPagesLimit: planConfig.pdfPagesPerMonth } }
+      );
+      pdfSeeded += result.modifiedCount;
+    }
+    const pdfResetSeeded = await Org.updateMany(
+      { pdfPagesResetAt: { $exists: false } },
+      { $set: { pdfPagesResetAt: pdfNextReset } }
+    );
+    if (pdfSeeded > 0 || pdfResetSeeded.modifiedCount > 0) {
+      console.log(`Seeded pdfPagesLimit on ${pdfSeeded} orgs + pdfPagesResetAt on ${pdfResetSeeded.modifiedCount} orgs`);
     }
 
     // Backfill TTL expireAt on already-terminal webhook deliveries so they

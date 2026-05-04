@@ -48,22 +48,24 @@ export async function createCustomer(email, name) {
  * Initialize a Paystack transaction.
  * Passing a planCode turns this into a subscription transaction —
  * Paystack will auto-create the recurring subscription after successful payment.
+ * Pass null/undefined planCode for a one-off charge (e.g. credit pack).
  *
  * @param {string} email          - Customer email
  * @param {number} amount         - Amount in kobo (e.g. 499900 for KES 4,999)
- * @param {string} planCode       - Paystack plan code (PLN_xxx) from env
+ * @param {string|null} planCode  - Paystack plan code (PLN_xxx) for subscriptions, or null for one-off
  * @param {object} metadata       - Arbitrary metadata attached to the transaction
  * @returns {object} data.authorization_url — redirect the user here
  */
 export async function initializeTransaction(email, amount, planCode, metadata = {}) {
-  return paystackRequest('POST', '/transaction/initialize', {
+  const body = {
     email,
     amount,
-    plan: planCode,
     metadata,
     // callback_url overrides the dashboard default for this specific transaction
     callback_url: process.env.BILLING_CALLBACK_URL || `${process.env.BASE_URL || 'http://localhost:5000'}/api/billing/callback`,
-  });
+  };
+  if (planCode) body.plan = planCode;
+  return paystackRequest('POST', '/transaction/initialize', body);
 }
 
 /**

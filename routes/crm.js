@@ -113,9 +113,23 @@ router.get('/contacts/:id', protect, async (req, res) => {
   }
 });
 
+// Whitelist editable contact fields — keeps callers from setting
+// organization/_id/createdBy/isActive directly via the body.
+const CONTACT_EDITABLE_FIELDS = [
+  'firstName', 'lastName', 'email', 'phone', 'company', 'position', 'country',
+  'source', 'tags', 'notes', 'budget', 'interests', 'groupSize', 'customFields',
+];
+function pickContactFields(body) {
+  const out = {};
+  for (const f of CONTACT_EDITABLE_FIELDS) {
+    if (body[f] !== undefined) out[f] = body[f];
+  }
+  return out;
+}
+
 router.post('/contacts', protect, authorize('owner', 'admin', 'agent'), requireTrialContactQuota, async (req, res) => {
   try {
-    const contact = await Contact.create({ ...req.body, organization: req.organizationId });
+    const contact = await Contact.create({ ...pickContactFields(req.body), organization: req.organizationId });
     triggerAutomation('contact.created', { organizationId: req.organizationId, contact, userId: req.user._id });
     res.status(201).json(contact);
   } catch (error) {
@@ -127,7 +141,7 @@ router.put('/contacts/:id', protect, authorize('owner', 'admin', 'agent'), async
   try {
     const contact = await Contact.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
-      req.body,
+      pickContactFields(req.body),
       { new: true }
     );
     if (!contact) return res.status(404).json({ message: 'Not found' });
@@ -172,9 +186,20 @@ router.get('/pipelines', protect, async (req, res) => {
   }
 });
 
+// Whitelist editable pipeline fields. Without this, a caller could overwrite
+// `organization`, `isActive`, or arbitrary internal fields via the body.
+const PIPELINE_EDITABLE_FIELDS = ['name', 'isDefault', 'stages', 'visibility', 'members'];
+function pickPipelineFields(body) {
+  const out = {};
+  for (const f of PIPELINE_EDITABLE_FIELDS) {
+    if (body[f] !== undefined) out[f] = body[f];
+  }
+  return out;
+}
+
 router.post('/pipelines', protect, authorize('owner', 'admin'), requirePipelineQuota, async (req, res) => {
   try {
-    const pipeline = await Pipeline.create({ ...req.body, organization: req.organizationId });
+    const pipeline = await Pipeline.create({ ...pickPipelineFields(req.body), organization: req.organizationId });
     res.status(201).json(pipeline);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -185,7 +210,7 @@ router.put('/pipelines/:id', protect, authorize('owner', 'admin'), async (req, r
   try {
     const pipeline = await Pipeline.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
-      req.body,
+      pickPipelineFields(req.body),
       { new: true }
     );
     if (!pipeline) return res.status(404).json({ message: 'Not found' });
@@ -551,7 +576,17 @@ router.put('/deals/:id', protect, authorize('owner', 'admin', 'agent'), requireD
       } catch (err) { /* silent — notifications are best-effort */ }
     }
 
-    Object.assign(existing, req.body);
+    // Whitelist editable fields. Without this, an authenticated user could
+    // PUT { organization: <other> } to migrate a deal cross-tenant, or set
+    // createdBy / wonAt / lostAt / activities directly to spoof history.
+    const DEAL_EDITABLE_FIELDS = [
+      'title', 'contact', 'pipeline', 'stage', 'destination', 'travelDates',
+      'groupSize', 'budget', 'tripType', 'interests', 'specialRequests',
+      'value', 'currency', 'assignedTo', 'tags', 'wonAt', 'lostAt',
+    ];
+    for (const f of DEAL_EDITABLE_FIELDS) {
+      if (req.body[f] !== undefined) existing[f] = req.body[f];
+    }
     await existing.save();
 
     // If travel dates moved, recompute sendAt for any relative scheduled
@@ -724,6 +759,20 @@ router.get('/tasks', protect, async (req, res) => {
   }
 });
 
+// Whitelist editable task fields — keeps callers from setting createdBy /
+// organization / completedAt / reminderSentAt / etc. directly via the body.
+const TASK_EDITABLE_FIELDS = [
+  'title', 'description', 'status', 'priority', 'dueDate',
+  'assignedTo', 'deal', 'contact', 'reminderHours', 'tags',
+];
+function pickTaskFields(body) {
+  const out = {};
+  for (const f of TASK_EDITABLE_FIELDS) {
+    if (body[f] !== undefined) out[f] = body[f];
+  }
+  return out;
+}
+
 router.post('/tasks', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     // If the task is linked to a deal, the user must have access to that deal's pipeline.
@@ -745,7 +794,7 @@ router.post('/tasks', protect, authorize('owner', 'admin', 'agent'), async (req,
     }
 
     const task = await Task.create({
-      ...req.body,
+      ...pickTaskFields(req.body),
       organization: req.organizationId,
       createdBy: req.user._id,
     });
@@ -785,19 +834,20 @@ router.put('/tasks/:id', protect, authorize('owner', 'admin', 'agent'), async (r
       if (!isOwner) return res.status(403).json({ message: 'You can only edit your own tasks' });
     }
 
-    if (req.body.status === 'done') req.body.completedAt = new Date();
+    const update = pickTaskFields(req.body);
+    if (update.status === 'done') update.completedAt = new Date();
 
-    const dueDateChanged = 'dueDate' in req.body &&
-      new Date(req.body.dueDate || 0).getTime() !== new Date(prior.dueDate || 0).getTime();
-    const reminderHoursChanged = 'reminderHours' in req.body &&
-      req.body.reminderHours !== prior.reminderHours;
+    const dueDateChanged = update.dueDate !== undefined &&
+      new Date(update.dueDate || 0).getTime() !== new Date(prior.dueDate || 0).getTime();
+    const reminderHoursChanged = update.reminderHours !== undefined &&
+      update.reminderHours !== prior.reminderHours;
     if (dueDateChanged || reminderHoursChanged) {
-      req.body.reminderSentAt = null;
+      update.reminderSentAt = null;
     }
 
     const task = await Task.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
-      req.body,
+      update,
       { new: true }
     ).populate('assignedTo', 'name avatar');
 

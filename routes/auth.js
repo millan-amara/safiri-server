@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
 import Organization from '../models/Organization.js';
 import { Pipeline } from '../models/Deal.js';
@@ -42,10 +43,20 @@ async function seedStarterPipelines(organizationId) {
   ]);
 }
 
+// Minimum password length, applied consistently across register / invite /
+// reset. 10 is enough to make online brute-force impractical without making
+// passphrases painful; for higher security pair with rate limiting (already
+// in place at /api/auth/* via app.js).
+const MIN_PASSWORD_LENGTH = 10;
+
 // Register new org + owner
 router.post('/register', async (req, res) => {
   try {
     const { name, email, password, companyName, phone } = req.body;
+    if (!email) return res.status(400).json({ message: 'Email is required' });
+    if (!password || password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
+    }
     if (!phone) return res.status(400).json({ message: 'Phone number is required' });
 
     // Create org
@@ -64,6 +75,8 @@ router.post('/register', async (req, res) => {
       trialEndsAt,
       aiCreditsLimit: trialPlan.aiCredits,
       aiCreditsResetAt,
+      pdfPagesLimit: trialPlan.pdfPagesPerMonth,
+      pdfPagesResetAt: aiCreditsResetAt,
       quotesMonthResetAt: aiCreditsResetAt,
       trialQuoteLimit: trialPlan.quotesPerMonth,
       defaults: {
@@ -115,7 +128,7 @@ router.post('/register', async (req, res) => {
       html: verifyEmailTemplate({ userName: name, verifyUrl }),
     }).catch(err => console.error('Verify email send failed:', err.message));
 
-    const token = generateToken(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
     res.status(201).json({ token, user: { ...user.toObject(), password: undefined }, organization: org });
   } catch (error) {
     if (error.code === 11000) {
@@ -143,9 +156,21 @@ router.post('/login', async (req, res) => {
     await user.save();
 
     const org = await Organization.findById(user.organization);
-    const token = generateToken(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
     
     res.json({ token, user: { ...user.toObject(), password: undefined, isSuperAdmin: isSuperAdminEmail(user.email) }, organization: org });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Logout — revokes every token currently held by this user by bumping
+// tokenVersion. Subsequent verifies in the protect middleware will reject any
+// JWT issued before the bump.
+router.post('/logout', protect, async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.user._id, { $inc: { tokenVersion: 1 } });
+    res.json({ message: 'Logged out' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -232,7 +257,7 @@ router.post('/invite/:token', async (req, res) => {
     const { name, password, phone } = req.body;
     if (!name || !password) return res.status(400).json({ message: 'Name and password are required' });
     if (!phone) return res.status(400).json({ message: 'Phone number is required' });
-    if (password.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' });
+    if (password.length < MIN_PASSWORD_LENGTH) return res.status(400).json({ message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
 
     const user = await User.findOne({
       inviteToken: req.params.token,
@@ -263,7 +288,7 @@ router.post('/invite/:token', async (req, res) => {
       }),
     });
 
-    const token = generateToken(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
     res.json({ token, user: { _id: user._id, name: user.name, email: user.email, role: user.role } });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -320,7 +345,7 @@ router.get('/reset-password/:token', async (req, res) => {
 router.post('/reset-password/:token', async (req, res) => {
   try {
     const { password } = req.body;
-    if (!password || password.length < 6) return res.status(400).json({ message: 'Password must be at least 6 characters' });
+    if (!password || password.length < MIN_PASSWORD_LENGTH) return res.status(400).json({ message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters` });
 
     const user = await User.findOne({
       resetToken: req.params.token,
@@ -331,9 +356,12 @@ router.post('/reset-password/:token', async (req, res) => {
     user.password = password;
     user.resetToken = undefined;
     user.resetTokenExpires = undefined;
+    // Invalidate all existing sessions on password reset — anything still
+    // logged in with a stolen token now has 30 days minus elapsed cancelled.
+    user.tokenVersion = (user.tokenVersion || 0) + 1;
     await user.save();
 
-    const token = generateToken(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
     res.json({ token, message: 'Password reset successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -381,19 +409,34 @@ router.get('/google/callback', async (req, res) => {
     });
     const googleUser = await userInfoRes.json();
 
+    // Refuse unverified Google emails — without this, anyone who creates a
+    // Google account claiming an arbitrary address (and never confirms it)
+    // could be auto-linked into a victim's local account below.
+    if (!googleUser.email || !googleUser.verified_email) {
+      return res.redirect(`${process.env.CLIENT_URL}/login?error=unverified_email`);
+    }
+
     // Find or create user
     let user = await User.findOne({ googleId: googleUser.id });
 
     if (!user) {
-      // Check if email exists (link accounts)
-      user = await User.findOne({ email: googleUser.email });
+      // Check if email exists (link accounts). Only auto-link when the existing
+      // account is itself a Google account or has a verified email — otherwise a
+      // malicious Google sign-in would silently take over a local account
+      // whose owner has never logged in via Google.
+      const existing = await User.findOne({ email: googleUser.email });
 
-      if (user) {
+      if (existing && (existing.authProvider === 'google' || existing.emailVerified)) {
+        user = existing;
         // Link Google to existing account
         user.googleId = googleUser.id;
         user.authProvider = 'google';
         if (!user.avatar && googleUser.picture) user.avatar = googleUser.picture;
         await user.save();
+      } else if (existing) {
+        // Local account exists but email isn't verified — refuse the auto-link
+        // and tell the user to verify their email first.
+        return res.redirect(`${process.env.CLIENT_URL}/login?error=verify_email_first`);
       } else {
         // Create new org + user
         const slug = slugify(googleUser.name || 'workspace', { lower: true, strict: true }) + '-' + Date.now().toString(36);
@@ -410,6 +453,8 @@ router.get('/google/callback', async (req, res) => {
           trialEndsAt: gTrialEndsAt,
           aiCreditsLimit: gTrialPlan.aiCredits,
           aiCreditsResetAt: gAiCreditsResetAt,
+          pdfPagesLimit: gTrialPlan.pdfPagesPerMonth,
+          pdfPagesResetAt: gAiCreditsResetAt,
           quotesMonthResetAt: gAiCreditsResetAt,
           trialQuoteLimit: gTrialPlan.quotesPerMonth,
           defaults: {
@@ -440,13 +485,53 @@ router.get('/google/callback', async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
-    const token = generateToken(user._id);
-
-    // Redirect to client with token
-    res.redirect(`${process.env.CLIENT_URL}/login?token=${token}`);
+    // Don't put the session JWT in the redirect URL — URLs leak via browser
+    // history, Referer, and access logs. Issue a short-lived single-use code
+    // that the client redeems via POST /auth/oauth-exchange for the real JWT.
+    const exchangeCode = jwt.sign(
+      { id: user._id, purpose: 'oauth_exchange' },
+      process.env.JWT_SECRET,
+      { expiresIn: '60s' }
+    );
+    res.redirect(`${process.env.CLIENT_URL}/login?oauth_code=${exchangeCode}`);
   } catch (error) {
     console.error('Google OAuth error:', error);
     res.redirect(`${process.env.CLIENT_URL}/login?error=oauth_failed`);
+  }
+});
+
+// ─── OAUTH EXCHANGE ─────────────────────────────────
+// Redeem a one-time oauth_code (issued by /auth/google/callback) for a real
+// session JWT. Code is single-use in practice because it expires after 60s
+// and the client deletes it from the URL on first read.
+router.post('/oauth-exchange', async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ message: 'Missing code' });
+
+    let decoded;
+    try {
+      decoded = jwt.verify(code, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ message: 'Invalid or expired code' });
+    }
+    if (decoded.purpose !== 'oauth_exchange') {
+      return res.status(401).json({ message: 'Invalid code' });
+    }
+
+    const user = await User.findById(decoded.id);
+    if (!user || !user.isActive) return res.status(401).json({ message: 'User not found' });
+
+    const org = await Organization.findById(user.organization);
+    const token = generateToken(user._id, user.tokenVersion);
+
+    res.json({
+      token,
+      user: { ...user.toObject(), password: undefined, isSuperAdmin: isSuperAdminEmail(user.email) },
+      organization: org,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
   }
 });
 

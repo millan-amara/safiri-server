@@ -29,12 +29,14 @@ async function hydrateHotelImages(quote) {
   const ids = [...new Set(needsImages.map(d => d.hotel.hotelId || d.hotel._id).filter(Boolean).map(String))];
   const names = [...new Set(needsImages.map(d => d.hotel.name).filter(Boolean))];
 
+  // Both lookup branches MUST be scoped by organization, otherwise a hotelId
+  // planted in days[].hotel from a tampered quote can pull cross-tenant data.
   const orConds = [];
   if (ids.length) orConds.push({ _id: { $in: ids } });
-  if (names.length) orConds.push({ organization: quote.organization, name: { $in: names } });
+  if (names.length) orConds.push({ name: { $in: names } });
   if (!orConds.length) return;
 
-  const hotels = await Hotel.find({ $or: orConds }).select('name images').lean();
+  const hotels = await Hotel.find({ organization: quote.organization, $or: orConds }).select('name images').lean();
   const byId = new Map(hotels.map(h => [String(h._id), h.images || []]));
   const byName = new Map(hotels.map(h => [h.name, h.images || []]));
 

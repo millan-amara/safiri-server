@@ -7,10 +7,10 @@ const router = Router();
 // Get notifications for current user
 router.get('/', protect, async (req, res) => {
   try {
-    const notifications = await Notification.find({ user: req.user._id })
+    const notifications = await Notification.find({ user: req.user._id, organization: req.organizationId })
       .sort({ createdAt: -1 })
       .limit(30);
-    const unreadCount = await Notification.countDocuments({ user: req.user._id, isRead: false });
+    const unreadCount = await Notification.countDocuments({ user: req.user._id, organization: req.organizationId, isRead: false });
     res.json({ notifications, unreadCount });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -21,7 +21,7 @@ router.get('/', protect, async (req, res) => {
 router.put('/:id/read', protect, async (req, res) => {
   try {
     await Notification.findOneAndUpdate(
-      { _id: req.params.id, user: req.user._id },
+      { _id: req.params.id, user: req.user._id, organization: req.organizationId },
       { isRead: true, readAt: new Date() }
     );
     res.json({ message: 'Marked as read' });
@@ -34,7 +34,7 @@ router.put('/:id/read', protect, async (req, res) => {
 router.put('/read-all', protect, async (req, res) => {
   try {
     await Notification.updateMany(
-      { user: req.user._id, isRead: false },
+      { user: req.user._id, organization: req.organizationId, isRead: false },
       { isRead: true, readAt: new Date() }
     );
     res.json({ message: 'All marked as read' });

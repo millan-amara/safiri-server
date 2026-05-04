@@ -9,20 +9,28 @@ export const protect = async (req, res, next) => {
     if (req.headers.authorization?.startsWith('Bearer')) {
       token = req.headers.authorization.split(' ')[1];
     }
-    // Also accept token as query param (for PDF links opened in new tabs)
-    if (!token && req.query.token) {
-      token = req.query.token;
-    }
 
     if (!token) {
       return res.status(401).json({ message: 'Not authorized' });
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // Reject single-use OAuth-exchange codes here — they're meant to be redeemed
+    // by the /auth/oauth-exchange endpoint, not used as session tokens.
+    if (decoded.purpose && decoded.purpose !== 'session') {
+      return res.status(401).json({ message: 'Not authorized' });
+    }
     const user = await User.findById(decoded.id).select('-password');
 
     if (!user || !user.isActive) {
       return res.status(401).json({ message: 'Not authorized' });
+    }
+
+    // Token revocation: tokens issued before the user's tokenVersion was bumped
+    // (logout, password reset) are rejected even though they're still inside
+    // their JWT expiry window.
+    if ((decoded.tv ?? 0) !== (user.tokenVersion ?? 0)) {
+      return res.status(401).json({ message: 'Session expired' });
     }
 
     req.user = user;
@@ -93,9 +101,15 @@ export const requireSuperAdmin = (req, res, next) => {
   next();
 };
 
-// Generate JWT
-export const generateToken = (userId) => {
-  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRE || '30d',
-  });
+// Generate JWT. `purpose: 'session'` distinguishes long-lived session tokens
+// from short-lived single-use codes (e.g. OAuth exchange) signed with the
+// same secret — the middleware rejects anything that isn't 'session'.
+// `tv` carries the user's tokenVersion at issue time; the middleware refuses
+// the token if the user has since bumped tokenVersion (logout/reset).
+export const generateToken = (userId, tokenVersion = 0) => {
+  return jwt.sign(
+    { id: userId, purpose: 'session', tv: tokenVersion },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.JWT_EXPIRE || '7d' },
+  );
 };

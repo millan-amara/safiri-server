@@ -6,14 +6,13 @@ import Transport from '../models/Transport.js';
 import Activity from '../models/Activity.js';
 import Destination from '../models/Destination.js';
 import Package from '../models/Package.js';
-import { protect } from '../middleware/auth.js';
+import { protect, authorize } from '../middleware/auth.js';
 import { requirePartnerQuota, enforceImageCap, enforceCsvRowCap } from '../middleware/partnerQuota.js';
 import { priceStay } from '../services/rateResolver.js';
 import { priceActivity } from '../services/activityPricer.js';
 import { priceTransport } from '../services/transportPricer.js';
-import { checkAiCredits } from '../middleware/subscription.js';
-import { logAiCall } from '../utils/aiLogger.js';
-import { AI_CREDIT_COST } from '../config/plans.js';
+import { checkPdfPages } from '../middleware/subscription.js';
+import { logAiCall, recordAiUsage } from '../utils/aiLogger.js';
 
 // Counts total rows across all sheets in an XLSX/CSV workbook.
 const xlsxRowCounter = (file) => {
@@ -24,13 +23,18 @@ const xlsxRowCounter = (file) => {
 const router = Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+// Escape regex metachars in user-supplied strings before constructing a
+// RegExp. Untrusted patterns like `(a+)+$` cause catastrophic backtracking
+// (ReDoS) that stalls the event loop.
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // ─── HOTELS ────────────────────────────────────────
 
 router.get('/hotels', protect, async (req, res) => {
   try {
     const { destination, search, page = 1, limit = 50 } = req.query;
     const filter = { organization: req.organizationId, isActive: true };
-    if (destination) filter.destination = new RegExp(destination, 'i');
+    if (destination) filter.destination = new RegExp(escapeRegex(destination), 'i');
     if (search) filter.$text = { $search: search };
     
     const hotels = await Hotel.find(filter)
@@ -55,14 +59,14 @@ router.get('/hotels/:id', protect, async (req, res) => {
   }
 });
 
-router.post('/hotels', protect, requirePartnerQuota('hotel'), enforceImageCap, async (req, res) => {
+router.post('/hotels', protect, authorize('owner', 'admin', 'agent'), requirePartnerQuota('hotel'), enforceImageCap, async (req, res) => {
   try {
     // Auto-create destination if the org doesn't already have one by that name.
     // Both find + create are org-scoped — Destinations are per-org inventory.
     if (req.body.destination) {
       const existing = await Destination.findOne({
         organization: req.organizationId,
-        name: { $regex: new RegExp(`^${req.body.destination}$`, 'i') },
+        name: { $regex: new RegExp(`^${escapeRegex(req.body.destination)}$`, 'i') },
       });
       if (!existing) {
         await Destination.create({
@@ -79,7 +83,7 @@ router.post('/hotels', protect, requirePartnerQuota('hotel'), enforceImageCap, a
   }
 });
 
-router.put('/hotels/:id', protect, enforceImageCap, async (req, res) => {
+router.put('/hotels/:id', protect, authorize('owner', 'admin', 'agent'), enforceImageCap, async (req, res) => {
   try {
     const hotel = await Hotel.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -148,15 +152,20 @@ router.post('/hotels/:id/price-stay', protect, async (req, res) => {
 // the operator in the loop for rate-card transcription, which is high-stakes.
 router.post('/hotels/extract-pdf',
   protect,
-  checkAiCredits(AI_CREDIT_COST.heavy),
-  logAiCall('extract-rate-card'),
   upload.single('file'),
+  // mimetype check runs as a thin pre-middleware so checkPdfPages doesn't
+  // try to load a non-PDF buffer with pdf-lib.
+  (req, res, next) => {
+    if (!req.file) return res.status(400).json({ message: 'No PDF uploaded' });
+    if (req.file.mimetype !== 'application/pdf') {
+      return res.status(400).json({ message: 'File must be a PDF' });
+    }
+    next();
+  },
+  checkPdfPages,
+  logAiCall('extract-rate-card'),
   async (req, res) => {
     try {
-      if (!req.file) return res.status(400).json({ message: 'No PDF uploaded' });
-      if (req.file.mimetype !== 'application/pdf') {
-        return res.status(400).json({ message: 'File must be a PDF' });
-      }
       const apiKey = process.env.ANTHROPIC_API_KEY;
       if (!apiKey) return res.status(500).json({ message: 'ANTHROPIC_API_KEY not configured' });
 
@@ -346,6 +355,7 @@ Rules:
         'Respond with ONLY the JSON object — no preamble.',
       ].filter(Boolean).join(' ');
 
+      const claudeModel = 'claude-sonnet-4-6';
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -354,13 +364,16 @@ Rules:
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          // 64000 is Sonnet-4's max output. Multi-hotel docs (A&K East Africa:
+          model: claudeModel,
+          // 64000 is Sonnet 4.6's max output. Multi-hotel docs (A&K East Africa:
           // 7 hotels × Rack+STO × LoS tiers × multi-season + pass-through fees)
           // blow past the 16000 we started with. Ceiling, not target — we pay
           // for actual usage only, so leaving headroom costs nothing.
           max_tokens: 64000,
-          system: systemPrompt,
+          // Cache the long extraction-rules system prompt — operators upload
+          // partner rate cards in batches during onboarding, so consecutive
+          // requests within 5 min hit a cached prefix and pay ~10% input price.
+          system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
           messages: [
             {
               role: 'user',
@@ -369,10 +382,10 @@ Rules:
                 { type: 'text', text: userText },
               ],
             },
-            // Prefill forces Claude's response to start with "{" — no natural-language
-            // preamble, no "Here is the JSON you requested:". The prefill is prepended
-            // back before parsing.
-            { role: 'assistant', content: '{' },
+            // No assistant-turn prefill — Sonnet 4.6 returns 400 on last-turn
+            // prefills. The system prompt + user text both demand JSON-only
+            // output, and the parser below tolerates any incidental preamble
+            // by locating the first '{' and last '}'.
           ],
         }),
       });
@@ -383,9 +396,16 @@ Rules:
       }
 
       const data = await response.json();
+      const u = data.usage || {};
+      recordAiUsage(req, {
+        model: claudeModel,
+        inputTokens: u.input_tokens || 0,
+        outputTokens: u.output_tokens || 0,
+        cacheReadInputTokens: u.cache_read_input_tokens || 0,
+        cacheCreationInputTokens: u.cache_creation_input_tokens || 0,
+      });
       const stopReason = data.stop_reason;
-      // Reconstruct full JSON with the prefilled "{"
-      const raw = '{' + (data.content?.[0]?.text || '');
+      const raw = data.content?.[0]?.text || '';
       const cleaned = raw.replace(/```json\s*|\s*```/g, '').trim();
       const start = cleaned.indexOf('{');
       const end = cleaned.lastIndexOf('}');
@@ -430,7 +450,7 @@ Rules:
     }
   });
 
-router.delete('/hotels/:id', protect, async (req, res) => {
+router.delete('/hotels/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     await Hotel.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -454,7 +474,7 @@ router.get('/transport', protect, async (req, res) => {
   }
 });
 
-router.post('/transport', protect, requirePartnerQuota('transport'), enforceImageCap, async (req, res) => {
+router.post('/transport', protect, authorize('owner', 'admin', 'agent'), requirePartnerQuota('transport'), enforceImageCap, async (req, res) => {
   try {
     const t = await Transport.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(t);
@@ -463,7 +483,7 @@ router.post('/transport', protect, requirePartnerQuota('transport'), enforceImag
   }
 });
 
-router.put('/transport/:id', protect, enforceImageCap, async (req, res) => {
+router.put('/transport/:id', protect, authorize('owner', 'admin', 'agent'), enforceImageCap, async (req, res) => {
   try {
     const t = await Transport.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -503,7 +523,7 @@ router.post('/transport/:id/price', protect, async (req, res) => {
   }
 });
 
-router.delete('/transport/:id', protect, async (req, res) => {
+router.delete('/transport/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     await Transport.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -521,7 +541,7 @@ router.get('/activities', protect, async (req, res) => {
   try {
     const { destination } = req.query;
     const filter = { organization: req.organizationId, isActive: true };
-    if (destination) filter.destination = new RegExp(destination, 'i');
+    if (destination) filter.destination = new RegExp(escapeRegex(destination), 'i');
     
     const activities = await Activity.find(filter).sort({ destination: 1, name: 1 });
     res.json({ activities, total: activities.length });
@@ -530,7 +550,7 @@ router.get('/activities', protect, async (req, res) => {
   }
 });
 
-router.post('/activities', protect, requirePartnerQuota('activity'), enforceImageCap, async (req, res) => {
+router.post('/activities', protect, authorize('owner', 'admin', 'agent'), requirePartnerQuota('activity'), enforceImageCap, async (req, res) => {
   try {
     const a = await Activity.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(a);
@@ -539,7 +559,7 @@ router.post('/activities', protect, requirePartnerQuota('activity'), enforceImag
   }
 });
 
-router.put('/activities/:id', protect, enforceImageCap, async (req, res) => {
+router.put('/activities/:id', protect, authorize('owner', 'admin', 'agent'), enforceImageCap, async (req, res) => {
   try {
     const a = await Activity.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -553,7 +573,7 @@ router.put('/activities/:id', protect, enforceImageCap, async (req, res) => {
   }
 });
 
-router.delete('/activities/:id', protect, async (req, res) => {
+router.delete('/activities/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     await Activity.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -599,7 +619,7 @@ router.get('/packages', protect, async (req, res) => {
   try {
     const { destination } = req.query;
     const filter = { organization: req.organizationId, isActive: true };
-    if (destination) filter.destination = new RegExp(destination, 'i');
+    if (destination) filter.destination = new RegExp(escapeRegex(destination), 'i');
     const packages = await Package.find(filter).sort({ name: 1 });
     res.json({ packages, total: packages.length });
   } catch (error) {
@@ -618,7 +638,7 @@ router.get('/packages/:id', protect, async (req, res) => {
   }
 });
 
-router.post('/packages', protect, enforceImageCap, async (req, res) => {
+router.post('/packages', protect, authorize('owner', 'admin', 'agent'), enforceImageCap, async (req, res) => {
   try {
     const pkg = await Package.create({ ...req.body, organization: req.organizationId });
     res.status(201).json(pkg);
@@ -627,7 +647,7 @@ router.post('/packages', protect, enforceImageCap, async (req, res) => {
   }
 });
 
-router.put('/packages/:id', protect, enforceImageCap, async (req, res) => {
+router.put('/packages/:id', protect, authorize('owner', 'admin', 'agent'), enforceImageCap, async (req, res) => {
   try {
     const pkg = await Package.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -641,7 +661,7 @@ router.put('/packages/:id', protect, enforceImageCap, async (req, res) => {
   }
 });
 
-router.delete('/packages/:id', protect, async (req, res) => {
+router.delete('/packages/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     await Package.findOneAndUpdate(
       { _id: req.params.id, organization: req.organizationId },
@@ -661,7 +681,7 @@ router.delete('/packages/:id', protect, async (req, res) => {
 // record has none (never clobbers operator-entered values).
 // Same merge semantics for hotels: append rate lists by name, fill shared
 // contract/policy fields only where the existing record is blank.
-router.put('/hotels/:id/merge-rate-lists', protect, async (req, res) => {
+router.put('/hotels/:id/merge-rate-lists', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const hotel = await Hotel.findOne({ _id: req.params.id, organization: req.organizationId });
     if (!hotel) return res.status(404).json({ message: 'Not found' });
@@ -696,7 +716,7 @@ router.put('/hotels/:id/merge-rate-lists', protect, async (req, res) => {
   }
 });
 
-router.put('/packages/:id/merge-pricing-lists', protect, async (req, res) => {
+router.put('/packages/:id/merge-pricing-lists', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const pkg = await Package.findOne({ _id: req.params.id, organization: req.organizationId });
     if (!pkg) return res.status(404).json({ message: 'Not found' });
@@ -948,7 +968,7 @@ function indexByList(sheetData) {
   return out;
 }
 
-router.post('/import', protect, upload.single('file'), enforceCsvRowCap(xlsxRowCounter), async (req, res) => {
+router.post('/import', protect, authorize('owner', 'admin', 'agent'), upload.single('file'), enforceCsvRowCap(xlsxRowCounter), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
@@ -1076,7 +1096,7 @@ router.post('/import', protect, upload.single('file'), enforceCsvRowCap(xlsxRowC
               seenDestinations.add(meta.destination);
               const existing = await Destination.findOne({
                 organization: req.organizationId,
-                name: { $regex: new RegExp(`^${meta.destination}$`, 'i') },
+                name: { $regex: new RegExp(`^${escapeRegex(meta.destination)}$`, 'i') },
               });
               if (!existing) {
                 await Destination.create({
@@ -1205,7 +1225,7 @@ router.post('/import', protect, upload.single('file'), enforceCsvRowCap(xlsxRowC
               seenDestinations.add(row.Destination);
               const existing = await Destination.findOne({
                 organization: req.organizationId,
-                name: { $regex: new RegExp(`^${row.Destination}$`, 'i') },
+                name: { $regex: new RegExp(`^${escapeRegex(row.Destination)}$`, 'i') },
               });
               if (!existing) {
                 await Destination.create({

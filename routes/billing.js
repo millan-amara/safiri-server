@@ -2,7 +2,7 @@ import { Router } from 'express';
 import Organization from '../models/Organization.js';
 import { protect } from '../middleware/auth.js';
 import * as paystack from '../services/paystack.js';
-import { PLANS } from '../config/plans.js';
+import { PLANS, CREDIT_PACKS, PDF_PAGE_PACKS } from '../config/plans.js';
 
 const router = Router();
 
@@ -18,6 +18,7 @@ router.get('/plans', (req, res) => {
     monthlyPriceKES: Math.round(p.amount / 100),
     annualPriceKES: p.annualAmount ? Math.round(p.annualAmount / 100) : null,
     aiCredits: p.aiCredits,
+    pdfPagesPerMonth: p.pdfPagesPerMonth,
     aiRateLimitPerMin: p.aiRateLimitPerMin,
     seats: p.seats,
     quotesPerMonth: p.quotesPerMonth,
@@ -32,7 +33,19 @@ router.get('/plans', (req, res) => {
     webhooks: p.webhooks,
     selfServe: SELF_SERVE_PLANS.includes(key),
   }));
-  res.json({ plans: catalog });
+  // Expose the credit-pack catalog alongside plans so the BillingPage only
+  // needs one round-trip to render both the subscription and top-up UI.
+  const creditPacks = Object.entries(CREDIT_PACKS).map(([key, p]) => ({
+    key,
+    credits: p.credits,
+    priceKES: Math.round(p.amount / 100),
+  }));
+  const pdfPagePacks = Object.entries(PDF_PAGE_PACKS).map(([key, p]) => ({
+    key,
+    pages: p.pages,
+    priceKES: Math.round(p.amount / 100),
+  }));
+  res.json({ plans: catalog, creditPacks, pdfPagePacks });
 });
 
 // ─── GET /api/billing/status ──────────────────────────────────────────────────
@@ -45,7 +58,7 @@ router.get('/plans', (req, res) => {
 router.get('/status', protect, async (req, res) => {
   try {
     const org = await Organization.findById(req.organizationId)
-      .select('subscriptionStatus plan annual trialStartedAt trialEndsAt trialQuoteCount trialQuoteLimit currentPeriodEnd aiCreditsUsed aiCreditsLimit aiCreditsResetAt quotesThisMonth libraryImageCount whiteLabel paystackSubscriptionCode pendingPlan')
+      .select('subscriptionStatus plan annual trialStartedAt trialEndsAt trialQuoteCount trialQuoteLimit currentPeriodEnd aiCreditsUsed aiCreditsLimit aiCreditsResetAt purchasedCredits pdfPagesUsed pdfPagesLimit pdfPagesResetAt purchasedPdfPages quotesThisMonth libraryImageCount whiteLabel paystackSubscriptionCode pendingPlan')
       .lean();
 
     if (!org) return res.status(404).json({ message: 'Organization not found' });
@@ -161,6 +174,106 @@ router.post('/checkout', protect, async (req, res) => {
   }
 });
 
+// ─── POST /api/billing/buy-credits ────────────────────────────────────────────
+
+/**
+ * One-off purchase of an AI credit pack. Initializes a Paystack transaction
+ * with no `plan` field (no recurring subscription), then the callback below
+ * tops up the org's `purchasedCredits` after successful payment.
+ *
+ * Body: { packKey: 'small'|'medium'|'large' }
+ * Returns: { authorizationUrl, reference }
+ */
+router.post('/buy-credits', protect, async (req, res) => {
+  try {
+    const { packKey } = req.body || {};
+    const pack = CREDIT_PACKS[packKey];
+    if (!pack) {
+      return res.status(400).json({ message: `Invalid pack. Must be one of: ${Object.keys(CREDIT_PACKS).join(', ')}` });
+    }
+
+    // Ensure the org has a Paystack customer record (mirrors /checkout).
+    let customerCode = req.organization?.paystackCustomerCode;
+    if (!customerCode) {
+      const orgDoc = await Organization.findById(req.organizationId).select('paystackCustomerCode');
+      customerCode = orgDoc?.paystackCustomerCode;
+      if (!customerCode) {
+        const { data: customer } = await paystack.createCustomer(req.user.email, req.user.name);
+        customerCode = customer.customer_code;
+        await Organization.findByIdAndUpdate(req.organizationId, { paystackCustomerCode: customerCode });
+      }
+    }
+
+    const { data } = await paystack.initializeTransaction(
+      req.user.email,
+      pack.amount,
+      null, // one-off — no subscription plan
+      {
+        kind: 'credit_pack',
+        organizationId: req.organizationId.toString(),
+        userId: req.user._id.toString(),
+        customerCode,
+        packKey,
+        credits: pack.credits,
+      }
+    );
+
+    res.json({ authorizationUrl: data.authorization_url, reference: data.reference });
+  } catch (err) {
+    console.error('[billing] buy-credits error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── POST /api/billing/buy-pdf-pages ──────────────────────────────────────────
+
+/**
+ * One-off purchase of a PDF page pack. Same shape as /buy-credits but tops up
+ * the org's `purchasedPdfPages` pool instead of `purchasedCredits`.
+ *
+ * Body: { packKey: 'small'|'medium'|'large' }
+ * Returns: { authorizationUrl, reference }
+ */
+router.post('/buy-pdf-pages', protect, async (req, res) => {
+  try {
+    const { packKey } = req.body || {};
+    const pack = PDF_PAGE_PACKS[packKey];
+    if (!pack) {
+      return res.status(400).json({ message: `Invalid pack. Must be one of: ${Object.keys(PDF_PAGE_PACKS).join(', ')}` });
+    }
+
+    let customerCode = req.organization?.paystackCustomerCode;
+    if (!customerCode) {
+      const orgDoc = await Organization.findById(req.organizationId).select('paystackCustomerCode');
+      customerCode = orgDoc?.paystackCustomerCode;
+      if (!customerCode) {
+        const { data: customer } = await paystack.createCustomer(req.user.email, req.user.name);
+        customerCode = customer.customer_code;
+        await Organization.findByIdAndUpdate(req.organizationId, { paystackCustomerCode: customerCode });
+      }
+    }
+
+    const { data } = await paystack.initializeTransaction(
+      req.user.email,
+      pack.amount,
+      null,
+      {
+        kind: 'pdf_pack',
+        organizationId: req.organizationId.toString(),
+        userId: req.user._id.toString(),
+        customerCode,
+        packKey,
+        pages: pack.pages,
+      }
+    );
+
+    res.json({ authorizationUrl: data.authorization_url, reference: data.reference });
+  } catch (err) {
+    console.error('[billing] buy-pdf-pages error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
 // ─── GET /api/billing/callback ────────────────────────────────────────────────
 
 /**
@@ -185,8 +298,53 @@ router.get('/callback', async (req, res) => {
       return res.redirect(`${frontendBilling}?error=payment_failed`);
     }
 
-    const { organizationId, plan, annual } = data.metadata || {};
-    if (!organizationId || !plan || !SELF_SERVE_PLANS.includes(plan)) {
+    const meta = data.metadata || {};
+    const { organizationId } = meta;
+    if (!organizationId) {
+      return res.redirect(`${frontendBilling}?error=invalid_metadata`);
+    }
+
+    // Credit-pack purchase: top up the one-off pool, no plan change. Dedup
+    // on `reference` so a browser reload here (and a parallel webhook) can't
+    // double-credit.
+    if (meta.kind === 'credit_pack') {
+      const pack = CREDIT_PACKS[meta.packKey];
+      const credits = pack?.credits || Number(meta.credits) || 0;
+      if (!credits) {
+        return res.redirect(`${frontendBilling}?error=invalid_metadata`);
+      }
+      await Organization.updateOne(
+        { _id: organizationId, appliedCreditPackRefs: { $ne: reference } },
+        {
+          $inc: { purchasedCredits: credits },
+          $push: { appliedCreditPackRefs: reference },
+        }
+      );
+      console.log(`[billing] callback credited ${credits} credits to org ${organizationId} (ref=${reference})`);
+      return res.redirect(`${frontendBilling}?success=true&credits=${credits}`);
+    }
+
+    // PDF page-pack purchase: top up purchasedPdfPages. Same dedup pattern.
+    if (meta.kind === 'pdf_pack') {
+      const pack = PDF_PAGE_PACKS[meta.packKey];
+      const pages = pack?.pages || Number(meta.pages) || 0;
+      if (!pages) {
+        return res.redirect(`${frontendBilling}?error=invalid_metadata`);
+      }
+      await Organization.updateOne(
+        { _id: organizationId, appliedPdfPackRefs: { $ne: reference } },
+        {
+          $inc: { purchasedPdfPages: pages },
+          $push: { appliedPdfPackRefs: reference },
+        }
+      );
+      console.log(`[billing] callback credited ${pages} PDF pages to org ${organizationId} (ref=${reference})`);
+      return res.redirect(`${frontendBilling}?success=true&pages=${pages}`);
+    }
+
+    // Subscription purchase / upgrade.
+    const { plan, annual } = meta;
+    if (!plan || !SELF_SERVE_PLANS.includes(plan)) {
       return res.redirect(`${frontendBilling}?error=invalid_metadata`);
     }
 
@@ -208,6 +366,7 @@ router.get('/callback', async (req, res) => {
       annual: !!annual,
       currentPeriodEnd: periodEnd,
       aiCreditsLimit: planConfig.aiCredits,
+      pdfPagesLimit: planConfig.pdfPagesPerMonth,
       whiteLabel: planConfig.whiteLabel,
       pendingPlan: null, // Any scheduled downgrade is superseded by this upgrade
       ...(data.authorization?.authorization_code && { paystackAuthorizationCode: data.authorization.authorization_code }),
@@ -246,12 +405,62 @@ router.post('/webhook', async (req, res) => {
     console.log(`[billing] webhook received: ${event}`);
 
     if (event === 'charge.success') {
-      // Fires on both the initial payment and recurring subscription charges.
-      // Use metadata.organizationId (set during checkout) for the first charge;
-      // for recurring charges, fall back to looking up by subscription code.
-      const orgId = data.metadata?.organizationId;
-      const subscriptionCode = data.subscription_code;
+      const meta = data.metadata || {};
+      const orgId = meta.organizationId;
 
+      // Credit-pack one-off charge — top up the purchased pool. The /callback
+      // route also does this; both run idempotently *only* if guarded against
+      // double-application, so we use the Paystack reference as a dedup key:
+      // a successful $inc here AND in /callback would double-credit. We rely
+      // on the practical fact that Paystack fires charge.success at most
+      // once per reference, and /callback runs on browser redirect which the
+      // user may or may not actually hit. This webhook is the reliable path.
+      // To prevent double-credit when both fire, we record the reference and
+      // skip if already applied.
+      if (meta.kind === 'credit_pack' && orgId) {
+        const pack = CREDIT_PACKS[meta.packKey];
+        const credits = pack?.credits || Number(meta.credits) || 0;
+        const reference = data.reference;
+        if (credits && reference) {
+          // Atomic: only credit if this reference hasn't been applied yet.
+          const result = await Organization.updateOne(
+            { _id: orgId, appliedCreditPackRefs: { $ne: reference } },
+            {
+              $inc: { purchasedCredits: credits },
+              $push: { appliedCreditPackRefs: reference },
+            }
+          );
+          if (result.modifiedCount > 0) {
+            console.log(`[billing] webhook credited ${credits} credits to org ${orgId} (ref=${reference})`);
+          }
+        }
+        return res.status(200).json({ received: true });
+      }
+
+      // PDF page pack — same shape, different pool.
+      if (meta.kind === 'pdf_pack' && orgId) {
+        const pack = PDF_PAGE_PACKS[meta.packKey];
+        const pages = pack?.pages || Number(meta.pages) || 0;
+        const reference = data.reference;
+        if (pages && reference) {
+          const result = await Organization.updateOne(
+            { _id: orgId, appliedPdfPackRefs: { $ne: reference } },
+            {
+              $inc: { purchasedPdfPages: pages },
+              $push: { appliedPdfPackRefs: reference },
+            }
+          );
+          if (result.modifiedCount > 0) {
+            console.log(`[billing] webhook credited ${pages} PDF pages to org ${orgId} (ref=${reference})`);
+          }
+        }
+        return res.status(200).json({ received: true });
+      }
+
+      // Subscription charge — fires on both the initial payment and recurring
+      // subscription charges. Use metadata.organizationId for the first
+      // charge; for recurring charges, fall back to subscription code.
+      const subscriptionCode = data.subscription_code;
       let query = orgId ? { _id: orgId } : null;
       if (!query && subscriptionCode) {
         query = { paystackSubscriptionCode: subscriptionCode };

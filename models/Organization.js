@@ -114,10 +114,31 @@ const organizationSchema = new mongoose.Schema({
   },
 
   // ─── AI credit ledger (resets calendar-monthly) ───────────────────────────
-  // Credits consumed at varying cost: heavy=10, medium=3, light=1 (see config/plans.js).
+  // Credits consumed at varying cost: heavy=50, medium=5, light=1 (see config/plans.js).
   aiCreditsUsed: { type: Number, default: 0 },
-  aiCreditsLimit: { type: Number, default: 20 }, // seeded from PLANS[plan].aiCredits
+  aiCreditsLimit: { type: Number, default: 100 }, // seeded from PLANS[plan].aiCredits
   aiCreditsResetAt: { type: Date },      // 1st of next month — set on org creation & each reset
+
+  // ─── One-off purchased credit pool (does NOT reset monthly) ───────────────
+  // Topped up via /api/billing/buy-credits. Charged AFTER monthly allowance is
+  // exhausted, so power users only burn paid credits when they overflow the
+  // plan. Carries indefinitely.
+  purchasedCredits: { type: Number, default: 0 },
+  // Paystack transaction references already credited to purchasedCredits —
+  // dedup key for the credit-pack callback + webhook (both fire on success;
+  // callback may also fire twice if the user reloads the redirect URL).
+  appliedCreditPackRefs: { type: [String], default: [] },
+
+  // ─── PDF rate-card extraction page ledger (resets calendar-monthly) ───────
+  // Pages charged per upload via partners.js extract-pdf, counted with pdf-lib
+  // before the Claude call. Separate from AI credits because PDF cost variance
+  // ($0.03-$0.72) was the original mispricing problem.
+  pdfPagesUsed: { type: Number, default: 0 },
+  pdfPagesLimit: { type: Number, default: 10 },  // seeded from PLANS[plan].pdfPagesPerMonth
+  pdfPagesResetAt: { type: Date },               // 1st of next month — set on org creation & each reset
+  // Purchased PDF pages overflow pool (does NOT reset). Charged after monthly.
+  purchasedPdfPages: { type: Number, default: 0 },
+  appliedPdfPackRefs: { type: [String], default: [] },
 
   // ─── Quote monthly counter (only enforced on tiers with a quotesPerMonth cap) ──
   quotesThisMonth: { type: Number, default: 0 },

@@ -114,7 +114,9 @@ export const checkAiCredits = (cost) => async (req, res, next) => {
   if (!req.organizationId) return next();
 
   try {
-    const before = await Organization.findOneAndUpdate(
+    // Try the monthly allowance first. Atomic conditional update — only
+    // succeeds if the org has enough monthly credits left to cover `cost`.
+    let charged = await Organization.findOneAndUpdate(
       {
         _id: req.organizationId,
         $expr: { $lte: [{ $add: ['$aiCreditsUsed', cost] }, '$aiCreditsLimit'] },
@@ -122,17 +124,29 @@ export const checkAiCredits = (cost) => async (req, res, next) => {
       { $inc: { aiCreditsUsed: cost } },
       { new: false }
     );
+    let chargedFrom = charged ? 'monthly' : null;
 
-    if (!before) {
+    // Monthly exhausted — try the one-off purchased pool. Same atomic pattern.
+    if (!charged) {
+      charged = await Organization.findOneAndUpdate(
+        { _id: req.organizationId, purchasedCredits: { $gte: cost } },
+        { $inc: { purchasedCredits: -cost } },
+        { new: false }
+      );
+      if (charged) chargedFrom = 'purchased';
+    }
+
+    if (!charged) {
       const org = req.organization
         || await Organization.findById(req.organizationId)
-            .select('aiCreditsUsed aiCreditsLimit aiCreditsResetAt')
+            .select('aiCreditsUsed aiCreditsLimit aiCreditsResetAt purchasedCredits')
             .lean();
 
       return res.status(402).json({
-        message: "You've used all your AI credits for this month. They reset on the 1st.",
+        message: "You've used all your AI credits for this month and have no purchased credits left. Buy a credit pack to keep going, or wait for your monthly allowance to reset on the 1st.",
         used: org.aiCreditsUsed,
         limit: org.aiCreditsLimit,
+        purchasedCredits: org.purchasedCredits || 0,
         cost,
         resetAt: org.aiCreditsResetAt,
         code: 'AI_CREDITS_EXHAUSTED',
@@ -142,19 +156,28 @@ export const checkAiCredits = (cost) => async (req, res, next) => {
     if (req.organization) {
       req.organization = {
         ...req.organization,
-        aiCreditsUsed: before.aiCreditsUsed + cost,
+        ...(chargedFrom === 'monthly'
+          ? { aiCreditsUsed: charged.aiCreditsUsed + cost }
+          : { purchasedCredits: Math.max(0, (charged.purchasedCredits || 0) - cost) }),
       };
     }
 
+    // Auto-refund on non-2xx — back to whichever pool we charged.
     let refunded = false;
     res.on('finish', () => {
       if (refunded) return;
       if (res.statusCode >= 200 && res.statusCode < 300) return;
       refunded = true;
-      Organization.updateOne(
-        { _id: req.organizationId, aiCreditsUsed: { $gte: cost } },
-        { $inc: { aiCreditsUsed: -cost } }
-      ).catch(e => console.error('AI credit refund failed:', e.message));
+      const refund = chargedFrom === 'monthly'
+        ? Organization.updateOne(
+            { _id: req.organizationId, aiCreditsUsed: { $gte: cost } },
+            { $inc: { aiCreditsUsed: -cost } }
+          )
+        : Organization.updateOne(
+            { _id: req.organizationId },
+            { $inc: { purchasedCredits: cost } }
+          );
+      refund.catch(e => console.error('AI credit refund failed:', e.message));
     });
 
     next();
@@ -165,6 +188,100 @@ export const checkAiCredits = (cost) => async (req, res, next) => {
 
 // Legacy export — kept as a thin alias to avoid breaking imports until all callsites migrate.
 export const checkAiItineraryQuota = checkAiCredits(AI_CREDIT_COST.heavy);
+
+// ─── PDF PAGE METERING ────────────────────────────────────────────────────────
+
+/**
+ * Counts pages in the uploaded PDF (req.file.buffer, set by multer) and
+ * atomically deducts that many pages from the org's monthly PDF allowance.
+ * If monthly is exhausted, falls through to purchasedPdfPages. Auto-refunds
+ * on non-2xx responses (Claude failure, parse error, etc.).
+ *
+ * Must run AFTER multer.single('file') so req.file is populated.
+ *
+ * Used by partners.js extract-pdf only — replaces the old fixed checkAiCredits(heavy)
+ * charge so cost is proportional to PDF size (a 1-page rate card costs 1 page,
+ * a 40-page A&K rate book costs 40 pages).
+ */
+export const checkPdfPages = async (req, res, next) => {
+  if (!req.organizationId) return next();
+  if (!req.file) {
+    return res.status(400).json({ message: 'No PDF file uploaded' });
+  }
+
+  // Count pages with pdf-lib. ignoreEncryption lets us count encrypted PDFs
+  // (the extraction itself may still fail downstream — we'll auto-refund).
+  let pageCount;
+  try {
+    const { PDFDocument } = await import('pdf-lib');
+    const pdfDoc = await PDFDocument.load(req.file.buffer, { ignoreEncryption: true });
+    pageCount = pdfDoc.getPageCount();
+  } catch (err) {
+    return res.status(400).json({ message: `Could not parse PDF: ${err.message}` });
+  }
+
+  if (pageCount <= 0) {
+    return res.status(400).json({ message: 'PDF has no pages' });
+  }
+
+  // Try monthly allowance first.
+  let charged = await Organization.findOneAndUpdate(
+    {
+      _id: req.organizationId,
+      $expr: { $lte: [{ $add: ['$pdfPagesUsed', pageCount] }, '$pdfPagesLimit'] },
+    },
+    { $inc: { pdfPagesUsed: pageCount } },
+    { new: false }
+  );
+  let chargedFrom = charged ? 'monthly' : null;
+
+  // Fall through to purchased pool.
+  if (!charged) {
+    charged = await Organization.findOneAndUpdate(
+      { _id: req.organizationId, purchasedPdfPages: { $gte: pageCount } },
+      { $inc: { purchasedPdfPages: -pageCount } },
+      { new: false }
+    );
+    if (charged) chargedFrom = 'purchased';
+  }
+
+  if (!charged) {
+    const org = await Organization.findById(req.organizationId)
+      .select('pdfPagesUsed pdfPagesLimit pdfPagesResetAt purchasedPdfPages')
+      .lean();
+    const monthlyLeft = Math.max(0, (org.pdfPagesLimit || 0) - (org.pdfPagesUsed || 0));
+    return res.status(402).json({
+      message: `This PDF has ${pageCount} pages, but you only have ${monthlyLeft} monthly + ${org.purchasedPdfPages || 0} purchased PDF pages remaining. Buy a PDF page pack to continue, or split the PDF into smaller files.`,
+      pageCount,
+      monthlyRemaining: monthlyLeft,
+      purchasedRemaining: org.purchasedPdfPages || 0,
+      resetAt: org.pdfPagesResetAt,
+      code: 'PDF_PAGES_EXHAUSTED',
+    });
+  }
+
+  // Stash for the route handler (handy for response metadata) and refund logic.
+  req._pdfPageDeduction = { pageCount, chargedFrom };
+
+  let refunded = false;
+  res.on('finish', () => {
+    if (refunded) return;
+    if (res.statusCode >= 200 && res.statusCode < 300) return;
+    refunded = true;
+    const refund = chargedFrom === 'monthly'
+      ? Organization.updateOne(
+          { _id: req.organizationId, pdfPagesUsed: { $gte: pageCount } },
+          { $inc: { pdfPagesUsed: -pageCount } }
+        )
+      : Organization.updateOne(
+          { _id: req.organizationId },
+          { $inc: { purchasedPdfPages: pageCount } }
+        );
+    refund.catch(e => console.error('PDF page refund failed:', e.message));
+  });
+
+  next();
+};
 
 // ─── TRIAL USAGE TRACKING ──────────────────────────────────────────────────────
 

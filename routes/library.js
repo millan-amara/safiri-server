@@ -63,8 +63,13 @@ router.get('/stock/search', protect, async (req, res) => {
     const url = `https://api.pexels.com/v1/search?query=${encodeURIComponent(q)}&per_page=${perPage}&page=${page}`;
     const response = await fetch(url, { headers: { Authorization: apiKey } });
     if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      return res.status(response.status).json({ message: `Pexels API error: ${response.status}`, detail: text.slice(0, 200) });
+      // Don't proxy Pexels' upstream body — it can include rate-limit headers,
+      // request-id strings, and other internal details that don't help our
+      // client and may leak operational info. Log it server-side and return a
+      // generic message.
+      const detail = await response.text().catch(() => '');
+      console.warn('[library/stock/search] pexels error', response.status, detail.slice(0, 200));
+      return res.status(response.status).json({ message: `Stock photo search failed (${response.status})` });
     }
     const data = await response.json();
 

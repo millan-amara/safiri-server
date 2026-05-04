@@ -15,6 +15,19 @@ function getClient() {
 const APP_NAME = process.env.APP_NAME || 'SafiriPro';
 const DEFAULT_FROM = process.env.EMAIL_FROM || `${APP_NAME} <noreply@azayon.com>`;
 
+// HTML-escape any user-controlled value before interpolating into a template.
+// Without this, an attacker who can set inviterName / userName / orgName (e.g.
+// during registration) could inject anchor/script tags that hijack the
+// recipient's email — phishing through a legitimate Resend send.
+const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+
+// URLs the server itself constructs (verify, reset, invite) are safe by
+// origin, but still encode them so a stray quote in CLIENT_URL doesn't break
+// the markup.
+const escapeAttr = (s) => String(s ?? '').replace(/["']/g, (c) => ({ '"': '&quot;', "'": '&#39;' }[c]));
+
 export async function sendEmail({ to, subject, html, from }) {
   const client = getClient();
 
@@ -74,7 +87,7 @@ const btnStyle = `
 `;
 
 function wrap(content, orgName) {
-  const brand = orgName || APP_NAME;
+  const brand = escapeHtml(orgName || APP_NAME);
   return `
     <div style="background-color: ${COLORS.bg}; padding: 24px 0;">
       <div style="${baseStyle}">
@@ -91,32 +104,38 @@ function wrap(content, orgName) {
 }
 
 export function inviteEmail({ inviterName, orgName, inviteUrl }) {
+  const safeInviter = escapeHtml(inviterName);
+  const safeOrg = escapeHtml(orgName);
+  const safeUrl = escapeAttr(inviteUrl);
+  const safeAppName = escapeHtml(APP_NAME);
   return wrap(`
     <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">You've been invited!</h3>
     <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">
-      ${inviterName} has invited you to join <strong style="color: ${COLORS.text};">${orgName}</strong> on ${APP_NAME}.
+      ${safeInviter} has invited you to join <strong style="color: ${COLORS.text};">${safeOrg}</strong> on ${safeAppName}.
     </p>
     <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">
       Click the button below to set up your account. This link expires in 48 hours.
     </p>
     <div style="text-align: center; margin: 32px 0;">
-      <a href="${inviteUrl}" style="${btnStyle}">Set Up My Account</a>
+      <a href="${safeUrl}" style="${btnStyle}">Set Up My Account</a>
     </div>
     <p style="color: ${COLORS.subtle}; font-size: 12px;">
       If the button doesn't work, copy this link:<br/>
-      <a href="${inviteUrl}" style="color: ${COLORS.primary}; word-break: break-all;">${inviteUrl}</a>
+      <a href="${safeUrl}" style="color: ${COLORS.primary}; word-break: break-all;">${escapeHtml(inviteUrl)}</a>
     </p>
   `, orgName);
 }
 
 export function resetPasswordEmail({ resetUrl, userName }) {
+  const safeName = escapeHtml(userName);
+  const safeUrl = escapeAttr(resetUrl);
   return wrap(`
     <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">Reset your password</h3>
     <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">
-      Hi${userName ? ' ' + userName : ''}, we received a request to reset your password. Click below to choose a new one. This link expires in 1 hour.
+      Hi${userName ? ' ' + safeName : ''}, we received a request to reset your password. Click below to choose a new one. This link expires in 1 hour.
     </p>
     <div style="text-align: center; margin: 32px 0;">
-      <a href="${resetUrl}" style="${btnStyle}">Reset Password</a>
+      <a href="${safeUrl}" style="${btnStyle}">Reset Password</a>
     </div>
     <p style="color: ${COLORS.subtle}; font-size: 12px;">
       If you didn't request this, you can safely ignore this email. Your password won't change.
@@ -125,28 +144,35 @@ export function resetPasswordEmail({ resetUrl, userName }) {
 }
 
 export function welcomeEmail({ userName, loginUrl, orgName }) {
+  const safeName = escapeHtml(userName);
+  const safeOrg = escapeHtml(orgName);
+  const safeUrl = escapeAttr(loginUrl);
+  const safeAppName = escapeHtml(APP_NAME);
   return wrap(`
-    <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">Welcome to ${orgName}!</h3>
+    <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">Welcome to ${safeOrg}!</h3>
     <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">
-      Hi ${userName}, your account is all set up. You can now log in and start working.
+      Hi ${safeName}, your account is all set up. You can now log in and start working.
     </p>
     <div style="text-align: center; margin: 32px 0;">
-      <a href="${loginUrl}" style="${btnStyle}">Go to ${APP_NAME}</a>
+      <a href="${safeUrl}" style="${btnStyle}">Go to ${safeAppName}</a>
     </div>
   `, orgName);
 }
 
 export function verifyEmailTemplate({ userName, verifyUrl }) {
+  const safeName = escapeHtml(userName);
+  const safeUrl = escapeAttr(verifyUrl);
+  const safeAppName = escapeHtml(APP_NAME);
   return wrap(`
     <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">Verify your email</h3>
     <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">
-      Hi ${userName}, please verify your email address to ensure you receive important notifications like quote views and client responses.
+      Hi ${safeName}, please verify your email address to ensure you receive important notifications like quote views and client responses.
     </p>
     <div style="text-align: center; margin: 32px 0;">
-      <a href="${verifyUrl}" style="${btnStyle}">Verify Email</a>
+      <a href="${safeUrl}" style="${btnStyle}">Verify Email</a>
     </div>
     <p style="color: ${COLORS.subtle}; font-size: 12px;">
-      You can use ${APP_NAME} without verifying, but you may miss email notifications.
+      You can use ${safeAppName} without verifying, but you may miss email notifications.
     </p>
   `);
 }

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { protect } from '../middleware/auth.js';
 import { checkAiCredits } from '../middleware/subscription.js';
-import { logAiCall } from '../utils/aiLogger.js';
+import { logAiCall, recordAiUsage } from '../utils/aiLogger.js';
 import { AI_CREDIT_COST, getPlan } from '../config/plans.js';
 import { Deal } from '../models/Deal.js';
 
@@ -29,10 +29,24 @@ const aiRateLimiter = rateLimit({
 
 router.use(aiRateLimiter);
 
-// Helper to call Claude API
-async function callClaude(systemPrompt, userMessage, maxTokens = 1024, model = 'claude-sonnet-4-20250514') {
+// Helper to call Claude API. Returns { text, usage } so callers can hand the
+// usage to recordAiUsage() for accurate per-call cost logging.
+//
+// `userMessage` is either a string or an array of content blocks (the API
+// accepts both shapes). Pass `cacheSystem: true` to wrap the system prompt in
+// a cache_control'd block — useful when the same long system prompt is reused.
+async function callClaude(systemPrompt, userMessage, options = {}) {
+  const {
+    maxTokens = 1024,
+    model = 'claude-sonnet-4-6',
+    cacheSystem = false,
+  } = options;
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
+
+  const system = cacheSystem
+    ? [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }]
+    : systemPrompt;
 
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -44,7 +58,7 @@ async function callClaude(systemPrompt, userMessage, maxTokens = 1024, model = '
     body: JSON.stringify({
       model,
       max_tokens: maxTokens,
-      system: systemPrompt,
+      system,
       messages: [{ role: 'user', content: userMessage }],
     }),
   });
@@ -55,7 +69,18 @@ async function callClaude(systemPrompt, userMessage, maxTokens = 1024, model = '
   }
 
   const data = await response.json();
-  return data.content?.[0]?.text || '';
+  const text = data.content?.[0]?.text || '';
+  const u = data.usage || {};
+  return {
+    text,
+    usage: {
+      model,
+      inputTokens: u.input_tokens || 0,
+      outputTokens: u.output_tokens || 0,
+      cacheReadInputTokens: u.cache_read_input_tokens || 0,
+      cacheCreationInputTokens: u.cache_creation_input_tokens || 0,
+    },
+  };
 }
 
 // ─── GENERATE SEGMENT NARRATIVES ──────────────────
@@ -85,7 +110,11 @@ Day ${dayNumber} of the trip${isFirst ? ' (first stop)' : ''}
 
 Return ONLY the narrative text, nothing else.`;
 
-    const narrative = await callClaude(system, prompt, 200);
+    const { text: narrative, usage } = await callClaude(system, prompt, {
+      maxTokens: 200,
+      model: 'claude-haiku-4-5',
+    });
+    recordAiUsage(req, usage);
     res.json({ narrative });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -137,7 +166,8 @@ Respond ONLY with this JSON structure:
   ]
 }`;
 
-    const raw = await callClaude(system, prompt, 1500);
+    const { text: raw, usage } = await callClaude(system, prompt, { maxTokens: 1500 });
+    recordAiUsage(req, usage);
     const cleaned = raw.replace(/```json\s*|\s*```/g, '').trim();
     const result = JSON.parse(cleaned);
     res.json(result);
@@ -169,7 +199,11 @@ Recent activity: ${activities?.slice(0, 3).join('; ') || 'None'}
 
 Provide a brief summary and suggest the best next action.`;
 
-    const summary = await callClaude(system, prompt, 200);
+    const { text: summary, usage } = await callClaude(system, prompt, {
+      maxTokens: 200,
+      model: 'claude-haiku-4-5',
+    });
+    recordAiUsage(req, usage);
     res.json({ summary });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -199,7 +233,11 @@ From: ${senderName || 'the team'} at ${companyName || 'our company'}
 
 Return ONLY the email body (no subject line).`;
 
-    const email = await callClaude(system, prompt, 500);
+    const { text: email, usage } = await callClaude(system, prompt, {
+      maxTokens: 500,
+      model: 'claude-haiku-4-5',
+    });
+    recordAiUsage(req, usage);
     res.json({ email });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -241,7 +279,11 @@ Respond ONLY with JSON:
   "confidence": "high" | "medium" | "low"
 }`;
 
-    const raw = await callClaude(system, prompt, 500);
+    const { text: raw, usage } = await callClaude(system, prompt, {
+      maxTokens: 500,
+      model: 'claude-haiku-4-5',
+    });
+    recordAiUsage(req, usage);
     const cleaned = raw.replace(/```json\s*|\s*```/g, '').trim();
     const result = JSON.parse(cleaned);
     res.json(result);
@@ -277,8 +319,12 @@ IMPORTANT: Only use destinations from the list above. Suggest the optimal route 
 Respond ONLY with this JSON structure, nothing else:
 {"route":[{"destination":"...","nights":2,"reason":"..."}],"summary":"...","transportNotes":"..."}`;
 
-    const raw = await callClaude(system, prompt, 800);
-    
+    const { text: raw, usage } = await callClaude(system, prompt, {
+      maxTokens: 800,
+      model: 'claude-haiku-4-5',
+    });
+    recordAiUsage(req, usage);
+
     // Clean and parse — handle various AI response formats
     let cleaned = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
     // Find the first { and last }
@@ -359,7 +405,12 @@ router.post('/draft-itinerary', heavy, logAiCall('draft-itinerary'), async (req,
 User request: "${prompt}"${tripLength ? `\nTrip length: ${tripLength} days` : ''}${budget ? `\nBudget: ${budget}` : ''}
 
 Respond ONLY with JSON: { "destinations": ["ExactName1", "ExactName2"] }`;
-        const extractorRaw = await callClaude(extractorSystem, extractorPrompt, 300, 'claude-haiku-4-5-20251001');
+        const { text: extractorRaw, usage: extractorUsage } = await callClaude(
+          extractorSystem,
+          extractorPrompt,
+          { maxTokens: 300, model: 'claude-haiku-4-5' }
+        );
+        recordAiUsage(req, extractorUsage);
         const cleaned = extractorRaw.replace(/```json\s*|\s*```/g, '').trim();
         const start = cleaned.indexOf('{');
         const end = cleaned.lastIndexOf('}');
@@ -447,21 +498,32 @@ When suggesting hotels and activities, ONLY use names that exist in the provided
 
 Plan logistics carefully: don't put two far-apart destinations on the same day, allow travel time, group consecutive nights at the same location.`;
 
-    const userMessage = `Plan a trip based on this brief: "${prompt}"
+    // Catalog goes first as a cache_control'd block — it's stable per operator
+    // across rapid drafts. Variable bits (prompt, trip length, etc.) follow
+    // after the breakpoint so they can change per request without invalidating.
+    // System prompt + catalog comfortably exceeds the 2048-token Sonnet cache
+    // floor, so the prefix actually caches.
+    const catalogBlock = `Available hotels in our database:
+${JSON.stringify(hotelCatalog, null, 2)}
+
+Available activities in our database:
+${JSON.stringify(activityCatalog, null, 2)}`;
+
+    const variableBlock = `Plan a trip based on this brief: "${prompt}"
 
 ${tripLength ? `Trip length: ${tripLength} days` : ''}
 ${travelers ? `Travelers: ${travelers}` : ''}
 ${budget ? `Budget level: ${budget}` : ''}
 
-Available hotels in our database:
-${JSON.stringify(hotelCatalog, null, 2)}
-
-Available activities in our database:
-${JSON.stringify(activityCatalog, null, 2)}
-
 Generate the full itinerary as JSON.`;
 
-    const response = await callClaude(systemPrompt, userMessage, 4096);
+    const userBlocks = [
+      { type: 'text', text: catalogBlock, cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: variableBlock },
+    ];
+
+    const { text: response, usage } = await callClaude(systemPrompt, userBlocks, { maxTokens: 4096 });
+    recordAiUsage(req, usage);
 
     // Parse JSON response
     let parsed;
@@ -700,7 +762,11 @@ BODY:
 ${notes ? `Operator's note for this specific message: ${notes}\n\n` : ''}Trip details:
 ${dealContext}`;
 
-    const response = await callClaude(system, prompt, 600);
+    const { text: response, usage } = await callClaude(system, prompt, {
+      maxTokens: 600,
+      model: 'claude-haiku-4-5',
+    });
+    recordAiUsage(req, usage);
 
     // Parse the response into subject + body. Be lenient — if the model didn't
     // follow the format we still want to surface something usable.

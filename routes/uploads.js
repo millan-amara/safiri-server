@@ -9,7 +9,46 @@ import Organization from '../models/Organization.js';
 import { enforceCsvRowCap } from '../middleware/partnerQuota.js';
 
 const router = Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+// Per-route multers. Image routes are restricted to common bitmap formats —
+// SVG is excluded because Cloudinary delivers it as XML/JS-capable content
+// that can run script in some viewers (and rendered inline in emails it's a
+// stored-XSS vector). Attachments are looser but still capped.
+const IMAGE_MIME_ALLOW = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const CSV_MIME_ALLOW = new Set([
+  'text/csv',
+  'application/vnd.ms-excel',                                            // some browsers report this for .csv
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',   // .xlsx (we accept here too — partner import path)
+  'text/plain',                                                          // some clients send this for .csv
+]);
+const ATTACHMENT_MIME_ALLOW = new Set([
+  ...IMAGE_MIME_ALLOW,
+  'application/pdf',
+  ...CSV_MIME_ALLOW,
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
+
+function makeUpload(allow) {
+  return multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+      if (!allow.has(file.mimetype)) {
+        return cb(new Error(`File type ${file.mimetype} is not allowed`));
+      }
+      cb(null, true);
+    },
+  });
+}
+
+const imageUpload = makeUpload(IMAGE_MIME_ALLOW);
+const csvUpload = makeUpload(CSV_MIME_ALLOW);
+const attachmentUpload = makeUpload(ATTACHMENT_MIME_ALLOW);
+
+// Legacy alias kept so existing references don't break — points at the
+// attachment-tier filter, the most permissive of the three.
+const upload = attachmentUpload;
 
 // Configure cloudinary
 const configureCloudinary = () => {
@@ -40,7 +79,7 @@ const uploadToCloudinary = (buffer, folder) => {
 
 // ─── UPLOAD IMAGE TO ENTITY ──────────────────────
 
-router.post('/image', protect, upload.single('image'), async (req, res) => {
+router.post('/image', protect, imageUpload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
@@ -89,7 +128,7 @@ router.post('/image', protect, upload.single('image'), async (req, res) => {
 
 // ─── UPLOAD LOGO ────────────────────────────────
 
-router.post('/logo', protect, upload.single('logo'), async (req, res) => {
+router.post('/logo', protect, imageUpload.single('logo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
@@ -109,7 +148,7 @@ router.post('/logo', protect, upload.single('logo'), async (req, res) => {
 });
 
 // ─── USER ASSET (avatar / signature) ─────────────
-router.post('/user-asset', protect, upload.single('file'), async (req, res) => {
+router.post('/user-asset', protect, imageUpload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
     let url;
@@ -160,33 +199,62 @@ router.delete('/image', protect, async (req, res) => {
 
 // ─── CONTACT CSV IMPORT (with AI column mapping) ─
 
+// RFC4180-ish CSV parser: handles quoted fields containing commas, quoted
+// double-quotes (escaped as ""), and CRLF/LF/CR line endings. The previous
+// version used split(',') which broke any field with a comma inside it
+// (typical for "Last, First" name styles or freeform notes).
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let inQuotes = false;
+  // Strip a UTF-8 BOM if present so the first header doesn't include it.
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; continue; }
+      if (c === '"') { inQuotes = false; continue; }
+      cell += c;
+      continue;
+    }
+    if (c === '"') { inQuotes = true; continue; }
+    if (c === ',') { row.push(cell); cell = ''; continue; }
+    if (c === '\r') { continue; } // handled by following \n or end-of-file
+    if (c === '\n') { row.push(cell); rows.push(row); row = []; cell = ''; continue; }
+    cell += c;
+  }
+  // Flush last cell/row if file didn't end with a newline.
+  if (cell.length > 0 || row.length > 0) { row.push(cell); rows.push(row); }
+  // Drop fully-empty trailing rows.
+  while (rows.length && rows[rows.length - 1].every(v => v === '')) rows.pop();
+  return rows;
+}
+
 const csvRowCounter = (file) => {
-  const text = file.buffer.toString('utf-8');
-  return text.split('\n').filter(l => l.trim()).length - 1; // minus header
+  const rows = parseCsv(file.buffer.toString('utf-8'));
+  return Math.max(0, rows.length - 1); // minus header
 };
 
-router.post('/contacts-csv', protect, upload.single('file'), enforceCsvRowCap(csvRowCounter), async (req, res) => {
+router.post('/contacts-csv', protect, csvUpload.single('file'), enforceCsvRowCap(csvRowCounter), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
-    // Parse CSV
-    const text = req.file.buffer.toString('utf-8');
-    const lines = text.split('\n').filter(l => l.trim());
-    if (lines.length < 2) return res.status(400).json({ message: 'CSV must have headers and at least one row' });
+    const rows = parseCsv(req.file.buffer.toString('utf-8'));
+    if (rows.length < 2) return res.status(400).json({ message: 'CSV must have headers and at least one row' });
 
-    const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
-    const rows = lines.slice(1, 4).map(line => {
-      const vals = line.split(',').map(v => v.trim().replace(/"/g, ''));
+    const headers = rows[0].map(h => h.trim());
+    const sampleRows = rows.slice(1, 4).map(vals => {
       const obj = {};
-      headers.forEach((h, i) => obj[h] = vals[i] || '');
+      headers.forEach((h, i) => obj[h] = (vals[i] ?? '').trim());
       return obj;
     });
 
     // Return headers + sample for AI mapping preview
     res.json({
       headers,
-      sampleRows: rows,
-      totalRows: lines.length - 1,
+      sampleRows,
+      totalRows: rows.length - 1,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -194,28 +262,29 @@ router.post('/contacts-csv', protect, upload.single('file'), enforceCsvRowCap(cs
 });
 
 // Apply AI-mapped column import
-router.post('/contacts-csv/apply', protect, upload.single('file'), enforceCsvRowCap(csvRowCounter), async (req, res) => {
+router.post('/contacts-csv/apply', protect, csvUpload.single('file'), enforceCsvRowCap(csvRowCounter), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
 
     const mappings = JSON.parse(req.body.mappings || '{}');
-    const text = req.file.buffer.toString('utf-8');
-    const lines = text.split('\n').filter(l => l.trim());
-    const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+    const rows = parseCsv(req.file.buffer.toString('utf-8'));
+    if (rows.length < 2) return res.status(400).json({ message: 'CSV must have headers and at least one row' });
+    const headers = rows[0].map(h => h.trim());
 
     const Contact = (await import('../models/Contact.js')).default;
     let imported = 0;
     const errors = [];
 
-    for (let i = 1; i < lines.length; i++) {
+    for (let i = 1; i < rows.length; i++) {
       try {
-        const vals = lines[i].split(',').map(v => v.trim().replace(/"/g, ''));
+        const vals = rows[i];
         const contact = { organization: req.organizationId, source: 'import' };
 
         headers.forEach((header, idx) => {
           const targetField = mappings[header];
-          if (targetField && vals[idx]) {
-            contact[targetField] = vals[idx];
+          const v = (vals[idx] ?? '').trim();
+          if (targetField && v) {
+            contact[targetField] = v;
           }
         });
 
@@ -228,7 +297,7 @@ router.post('/contacts-csv/apply', protect, upload.single('file'), enforceCsvRow
       }
     }
 
-    res.json({ imported, errors: errors.slice(0, 5), total: lines.length - 1 });
+    res.json({ imported, errors: errors.slice(0, 5), total: rows.length - 1 });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import crypto from 'crypto';
 import Organization from '../models/Organization.js';
 import User from '../models/User.js';
 import * as paystack from '../services/paystack.js';
@@ -6,13 +7,24 @@ import { PLANS, nextMonthlyResetDate } from '../config/plans.js';
 
 const router = Router();
 
+// Constant-time string compare. `===` returns as soon as it finds the first
+// mismatching byte, which leaks the prefix length via timing — over enough
+// requests an attacker can reconstruct the secret one byte at a time.
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
 /**
  * Guard middleware — all cron endpoints require the X-Cron-Secret header
  * matching the CRON_SECRET env var. Set this value in cron-job.org's custom headers.
  */
 function cronGuard(req, res, next) {
   const secret = req.headers['x-cron-secret'];
-  if (!secret || secret !== process.env.CRON_SECRET) {
+  if (!secret || !safeEqual(secret, process.env.CRON_SECRET || '')) {
     return res.status(401).json({ message: 'Unauthorized' });
   }
   next();
@@ -65,7 +77,11 @@ router.post('/check-trial-expirations', cronGuard, async (req, res) => {
  * Monthly reset for all orgs that could be using metered features:
  *   - aiCreditsUsed → 0
  *   - quotesThisMonth → 0
- *   - aiCreditsResetAt + quotesMonthResetAt → 1st of next UTC month
+ *   - pdfPagesUsed → 0
+ *   - aiCreditsResetAt + quotesMonthResetAt + pdfPagesResetAt → 1st of next UTC month
+ *
+ * `purchasedCredits` and `purchasedPdfPages` are NOT reset — those are paid
+ * top-ups that carry indefinitely.
  *
  * Idempotent — running twice in a month resets to 0 both times, which is fine.
  * Schedule via cron-job.org: 1st of every month at 00:01 UTC.
@@ -80,8 +96,10 @@ router.post('/reset-ai-credits', cronGuard, async (req, res) => {
         $set: {
           aiCreditsUsed: 0,
           quotesThisMonth: 0,
+          pdfPagesUsed: 0,
           aiCreditsResetAt: nextReset,
           quotesMonthResetAt: nextReset,
+          pdfPagesResetAt: nextReset,
         },
       }
     );
@@ -185,6 +203,7 @@ router.post('/process-scheduled-downgrades', cronGuard, async (req, res) => {
         org.subscriptionStatus = 'active';
         org.currentPeriodEnd = periodEnd;
         org.aiCreditsLimit = config.aiCredits;
+        org.pdfPagesLimit = config.pdfPagesPerMonth;
         org.whiteLabel = config.whiteLabel;
         org.pendingPlan = null;
         if (newSubscriptionCode) org.paystackSubscriptionCode = newSubscriptionCode;

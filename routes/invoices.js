@@ -274,9 +274,15 @@ router.get('/export.csv', protect, async (req, res) => {
       inv.notes || '',
     ]);
 
+    // Cells starting with =, +, -, @, tab, or CR are interpreted as formulas
+    // by Excel/Sheets when the CSV is opened. A deal title like
+    //   =cmd|'/c calc'!A0
+    // would execute on the accountant's machine. Prefix with a single quote
+    // (the Excel "this is a literal string" convention) to neutralize.
+    const formulaSafe = (s) => /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
     const csvEscape = (v) => {
       if (v === null || v === undefined) return '';
-      const s = String(v);
+      const s = formulaSafe(String(v));
       return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const csv = [headers, ...rows].map(row => row.map(csvEscape).join(',')).join('\r\n');

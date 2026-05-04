@@ -45,11 +45,14 @@ async function hydrateHotelImages(quote) {
   if (!needs.length) return;
   const ids = [...new Set(needs.map(d => d.hotel.hotelId || d.hotel._id).filter(Boolean).map(String))];
   const names = [...new Set(needs.map(d => d.hotel.name).filter(Boolean))];
+  // Both lookup branches MUST be scoped by organization. Without it, a quote
+  // with a foreign org's `Hotel._id` planted in days[].hotel.hotelId would
+  // pull cross-tenant hotel images.
   const orConds = [];
   if (ids.length) orConds.push({ _id: { $in: ids } });
-  if (names.length) orConds.push({ organization: quote.organization, name: { $in: names } });
+  if (names.length) orConds.push({ name: { $in: names } });
   if (!orConds.length) return;
-  const hotels = await Hotel.find({ $or: orConds }).select('name images').lean();
+  const hotels = await Hotel.find({ organization: quote.organization, $or: orConds }).select('name images').lean();
   const byId = new Map(hotels.map(h => [String(h._id), h.images || []]));
   const byName = new Map(hotels.map(h => [h.name, h.images || []]));
   for (const d of needs) {
@@ -189,9 +192,24 @@ router.post('/', protect, authorize('owner', 'admin', 'agent'), requireQuoteQuot
 });
 
 // Update quote
+// Whitelist of fields a caller can modify on an existing quote. Anything else
+// (organization, createdBy, quoteNumber, shareToken, tracking, etc.) is
+// dropped — preventing cross-tenant moves and identity spoofing via PUT body.
+const QUOTE_EDITABLE_FIELDS = [
+  'title', 'tripTitle', 'startDate', 'endDate', 'startPoint', 'endPoint',
+  'travelers', 'adults', 'childAges', 'clientType', 'nationality',
+  'currency', 'days', 'pricing', 'inclusions', 'exclusions', 'notes',
+  'coverNarrative', 'closingNote', 'highlights', 'pdfStyle', 'coverLayout',
+  'brandingSnapshot', 'shareSettings', 'status',
+  'contact', 'deal',
+];
+
 router.put('/:id', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
-    const body = { ...req.body };
+    const body = {};
+    for (const f of QUOTE_EDITABLE_FIELDS) {
+      if (req.body[f] !== undefined) body[f] = req.body[f];
+    }
     if (body.days) body.days = sanitizeDays(body.days);
     if (body.contact === '' || body.contact === null) body.contact = undefined;
     if (body.deal === '' || body.deal === null) body.deal = undefined;
@@ -429,13 +447,19 @@ router.get('/share/:token', async (req, res) => {
 
     await quote.save();
 
-    // Return clean version for client (no internal pricing)
-    const clientQuote = quote.toObject();
-    const snap = clientQuote.brandingSnapshot || {};
+    // Build a public-safe projection. Spreading quote.toObject() leaks the
+    // operator's margin/cost, every prior viewer's IP/UA via tracking.viewLog,
+    // creator phone/email, internal notes, etc. Whitelist fields explicitly
+    // and sanitize pricing to never include cost or margin.
+    const full = quote.toObject();
+
+    // Hydrate branding/hotel images on the working copy first so the share
+    // payload has the merged data the client view expects.
+    const snap = full.brandingSnapshot || {};
     if (!snap.coverQuote || !snap.aboutUs) {
-      const org = await Organization.findById(clientQuote.organization).select('branding businessInfo').lean();
+      const org = await Organization.findById(full.organization).select('branding businessInfo').lean();
       if (org) {
-        clientQuote.brandingSnapshot = {
+        full.brandingSnapshot = {
           ...snap,
           coverQuote: snap.coverQuote || org.branding?.coverQuote || '',
           coverQuoteAuthor: snap.coverQuoteAuthor || org.branding?.coverQuoteAuthor || '',
@@ -443,14 +467,65 @@ router.get('/share/:token', async (req, res) => {
         };
       }
     }
-    await hydrateHotelImages(clientQuote);
-    if (clientQuote.pricing.displayMode === 'total_only') {
-      delete clientQuote.pricing.subtotal;
-      delete clientQuote.pricing.marginPercent;
-      delete clientQuote.pricing.marginAmount;
+    await hydrateHotelImages(full);
+
+    // Strip cost / margin from pricing regardless of displayMode — the client
+    // never needs to see the operator's internal numbers.
+    const safePricing = full.pricing ? { ...full.pricing } : {};
+    delete safePricing.cost;
+    delete safePricing.marginAmount;
+    delete safePricing.marginPercent;
+    if (safePricing.displayMode === 'total_only') {
+      delete safePricing.subtotal;
     }
 
-    res.json(clientQuote);
+    // Createdby — only public-facing fields. Email/phone aren't surfaced to
+    // the client unless the operator explicitly opts them into branding.
+    const createdBy = full.createdBy && {
+      name: full.createdBy.name,
+      jobTitle: full.createdBy.jobTitle,
+      avatar: full.createdBy.avatar,
+      signature: full.createdBy.signature,
+      signatureNote: full.createdBy.signatureNote,
+    };
+
+    // Contact — first name + country only (so the client sees personalised
+    // greeting), never the full email/phone of whoever is being quoted.
+    const contact = full.contact && {
+      firstName: full.contact.firstName,
+      lastName: full.contact.lastName,
+      country: full.contact.country,
+    };
+
+    res.json({
+      _id: full._id,
+      quoteNumber: full.quoteNumber,
+      title: full.title,
+      tripTitle: full.tripTitle,
+      version: full.version,
+      status: full.status,
+      startDate: full.startDate,
+      endDate: full.endDate,
+      startPoint: full.startPoint,
+      endPoint: full.endPoint,
+      travelers: full.travelers,
+      adults: full.adults,
+      childAges: full.childAges,
+      currency: full.currency,
+      days: full.days,
+      pricing: safePricing,
+      inclusions: full.inclusions,
+      exclusions: full.exclusions,
+      coverNarrative: full.coverNarrative,
+      closingNote: full.closingNote,
+      highlights: full.highlights,
+      pdfStyle: full.pdfStyle,
+      coverLayout: full.coverLayout,
+      brandingSnapshot: full.brandingSnapshot,
+      shareSettings: full.shareSettings,
+      createdBy,
+      contact,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -461,6 +536,21 @@ router.post('/share/:token/accept', async (req, res) => {
   try {
     const quote = await Quote.findOne({ shareToken: req.params.token });
     if (!quote) return res.status(404).json({ message: 'Quote not found' });
+
+    if (quote.shareSettings?.expiresAt && new Date() > quote.shareSettings.expiresAt) {
+      return res.status(410).json({ message: 'This quote has expired' });
+    }
+
+    // Idempotent: if already accepted, return success without re-running side effects.
+    if (quote.status === 'accepted') {
+      return res.json({ message: 'Quote already accepted', status: 'accepted' });
+    }
+    // Only quotes the operator has actually surfaced to the client are acceptable —
+    // a 'draft' or already-'rejected' quote being flipped to 'accepted' via this
+    // public endpoint would be a bypass of the operator's intent.
+    if (!['sent', 'viewed'].includes(quote.status)) {
+      return res.status(409).json({ message: 'Quote is not in an acceptable state' });
+    }
 
     quote.status = 'accepted';
     quote.activities = quote.activities || [];
@@ -487,20 +577,27 @@ router.post('/share/:token/accept', async (req, res) => {
       });
     }
 
-    // Update linked deal stage
+    // Update linked deal stage. Scope by organization so a tampered quote.deal
+    // pointer can't mutate a foreign-tenant deal. Resolve the won-stage name
+    // from the deal's pipeline rather than hardcoding 'Won'.
     if (quote.deal) {
-      const { Deal } = await import('../models/Deal.js');
-      await Deal.findByIdAndUpdate(quote.deal, {
-        stage: 'Won',
-        wonAt: new Date(),
-        $push: {
-          activities: {
-            type: 'quote_sent',
-            description: `Client accepted quote #${quote.quoteNumber}`,
-            createdAt: new Date(),
-          },
-        },
-      });
+      const { Deal, Pipeline } = await import('../models/Deal.js');
+      const deal = await Deal.findOne({ _id: quote.deal, organization: quote.organization });
+      if (deal) {
+        let wonStageName = 'Won';
+        const pipeline = await Pipeline.findOne({ _id: deal.pipeline, organization: quote.organization }).lean();
+        const wonStage = pipeline?.stages?.find(s => s.type === 'won');
+        if (wonStage?.name) wonStageName = wonStage.name;
+
+        deal.stage = wonStageName;
+        deal.wonAt = new Date();
+        deal.activities.push({
+          type: 'quote_sent',
+          description: `Client accepted quote #${quote.quoteNumber}`,
+          createdAt: new Date(),
+        });
+        await deal.save();
+      }
     }
 
     res.json({ message: 'Quote accepted', status: 'accepted' });
@@ -515,21 +612,34 @@ router.post('/share/:token/request-changes', async (req, res) => {
     const quote = await Quote.findOne({ shareToken: req.params.token });
     if (!quote) return res.status(404).json({ message: 'Quote not found' });
 
-    const { message, clientName, clientEmail } = req.body;
+    if (quote.shareSettings?.expiresAt && new Date() > quote.shareSettings.expiresAt) {
+      return res.status(410).json({ message: 'This quote has expired' });
+    }
 
-    // Add to activity log on linked deal
+    // Cap user-controlled fields so a malicious client can't fill the deal
+    // activity log with arbitrarily large payloads (denial-of-service / abuse).
+    const cap = (s, n) => (typeof s === 'string' ? s.slice(0, n) : '');
+    const message = cap(req.body?.message, 2000);
+    const clientName = cap(req.body?.clientName, 200);
+    const clientEmail = cap(req.body?.clientEmail, 200);
+
+    // Add to activity log on linked deal — scoped to the quote's organization
+    // so a tampered quote.deal pointer can't write to a foreign-tenant deal.
     if (quote.deal) {
       const { Deal } = await import('../models/Deal.js');
-      await Deal.findByIdAndUpdate(quote.deal, {
-        $push: {
-          activities: {
-            type: 'quote_sent',
-            description: `Client requested changes on quote #${quote.quoteNumber}: "${message}"`,
-            createdAt: new Date(),
-            metadata: { clientName, clientEmail, changeRequest: message },
+      await Deal.findOneAndUpdate(
+        { _id: quote.deal, organization: quote.organization },
+        {
+          $push: {
+            activities: {
+              type: 'quote_sent',
+              description: `Client requested changes on quote #${quote.quoteNumber}: "${message}"`,
+              createdAt: new Date(),
+              metadata: { clientName, clientEmail, changeRequest: message },
+            },
           },
-        },
-      });
+        }
+      );
     }
 
     // Notify quote creator

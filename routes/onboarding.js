@@ -195,10 +195,18 @@ router.post('/dismiss-item', protect, async (req, res) => {
 });
 
 // Restore a previously skipped item (in case operator changes their mind).
+// itemId must match a known onboarding item — otherwise the caller could
+// $pull arbitrary strings from their own array (harmless) but more
+// importantly $pull is a no-op for missing values, so without an allowlist
+// the operation accepts anything. Mirror dismiss-item's validation.
 router.post('/restore-item', protect, async (req, res) => {
   try {
     const { itemId } = req.body;
     if (!itemId) return res.status(400).json({ message: 'itemId is required' });
+    const known = buildItemDefs().map(i => i.id);
+    if (!known.includes(itemId)) {
+      return res.status(400).json({ message: 'Unknown item' });
+    }
     await User.findByIdAndUpdate(req.user._id, { $pull: { onboardingItemsDismissed: itemId } });
     res.json({ ok: true });
   } catch (error) {

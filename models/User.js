@@ -38,6 +38,11 @@ const userSchema = new mongoose.Schema({
   lastLogin: { type: Date },
   invitedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
 
+  // Bumped on logout / password reset so existing JWTs stop working — gives
+  // server-side revocation despite stateless tokens. The middleware verifies
+  // the token's `tv` claim equals the current user.tokenVersion.
+  tokenVersion: { type: Number, default: 0 },
+
   // First-login checklist state (per-user).
   // `onboardingDismissed` hides the whole checklist; "Getting started" sidebar link reopens it.
   // `onboardingItemsDismissed` is an array of item ids the user has explicitly skipped

@@ -8,11 +8,20 @@ import crypto from 'crypto';
 import { PLANS, UNLIMITED } from '../config/plans.js';
 import { sendTestEvent } from '../services/invoiceWebhook.js';
 
-// Fields on the org doc that are controlled by the user's plan, not editable directly.
-// Stripped from any PUT /organization payload so a client can't grant itself paid features.
-const PLAN_CONTROLLED_FIELDS = ['plan', 'subscriptionStatus', 'aiCreditsLimit', 'aiCreditsUsed',
-  'whiteLabel', 'currentPeriodEnd', 'paystackCustomerCode', 'paystackSubscriptionCode',
-  'paystackAuthorizationCode', 'pendingPlan', 'annual', 'trialQuoteLimit', 'quotesThisMonth'];
+// Allowlist of organization fields an admin/owner can edit directly. Anything
+// not in this list (plan, subscriptionStatus, apiKey, billing identifiers,
+// counters, etc.) is rejected — switching from blacklist to allowlist closes
+// the gap where a forgotten field becomes self-grantable.
+const ORG_EDITABLE_FIELDS = [
+  'name',
+  'slug',
+  'branding',
+  'businessInfo',
+  'defaults',
+  'preferences',
+  'fxRates',
+  'webhookUrl',
+];
 
 const router = Router();
 
@@ -48,8 +57,12 @@ router.get('/organization', protect, async (req, res) => {
 
 router.put('/organization', protect, authorize('owner', 'admin'), async (req, res) => {
   try {
-    const update = { ...req.body };
-    for (const f of PLAN_CONTROLLED_FIELDS) delete update[f];
+    // Only copy fields explicitly on the allowlist — anything else (plan,
+    // apiKey, subscriptionStatus, counters, billing references) is dropped.
+    const update = {};
+    for (const f of ORG_EDITABLE_FIELDS) {
+      if (req.body[f] !== undefined) update[f] = req.body[f];
+    }
 
     // webhookUrl is a paid-plan feature — silently ignore the field on plans without it
     // rather than 403, so unrelated profile saves don't fail.

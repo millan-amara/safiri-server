@@ -20,9 +20,18 @@ const aiUsageLogSchema = new mongoose.Schema({
     type: String,
     required: true,
     // One of: draft-itinerary, generate-all-narratives, generate-narrative,
-    //         deal-summary, draft-email, suggest-route, map-columns
+    //         deal-summary, draft-email, suggest-route, map-columns,
+    //         draft-scheduled-message, extract-rate-card
   },
   timestamp: { type: Date, default: Date.now },
+  // Real token usage from Claude's response.usage. estimatedCostUsd is computed
+  // from these in aiLogger using the per-model pricing table (so we can re-cost
+  // historical logs if pricing changes).
+  model: { type: String, default: null },
+  inputTokens: { type: Number, default: 0 },
+  outputTokens: { type: Number, default: 0 },
+  cacheReadInputTokens: { type: Number, default: 0 },
+  cacheCreationInputTokens: { type: Number, default: 0 },
   estimatedCostUsd: { type: Number, required: true },
   success: { type: Boolean, required: true },
   errorMessage: { type: String, default: null },
