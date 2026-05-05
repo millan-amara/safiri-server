@@ -28,6 +28,7 @@ import invoicesRoutes from './routes/invoices.js';
 import vouchersRoutes from './routes/vouchers.js';
 import messagesRoutes from './routes/messages.js';
 import webhookDeliveriesRoutes from './routes/webhookDeliveries.js';
+import adminRoutes from './routes/admin.js';
 import { checkInactiveDeals, checkOverdueTasks } from './automations/engine.js';
 import { startReminderPoller } from './queues/reminderPoller.js';
 import { startScheduledMessagePoller } from './queues/scheduledMessagePoller.js';
@@ -127,6 +128,7 @@ app.use('/api/invoices', invoicesRoutes);
 app.use('/api/vouchers', vouchersRoutes);
 app.use('/api/messages', messagesRoutes);
 app.use('/api/webhook-deliveries', webhookDeliveriesRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
