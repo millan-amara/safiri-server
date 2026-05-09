@@ -10,6 +10,11 @@ import mongoose from 'mongoose';
 //   'pct'    — child pays `value`% of perPersonSharing (or singleOccupancy
 //              if the child has their own room, per `sharingRule`)
 //   'flat'   — child pays `value` absolute per night in the list's currency
+//
+// `position` handles ordinal sibling rules ("1st child free, 2nd child 50%")
+// that age-only brackets can't express. Resolver sorts kids by age and picks
+// brackets in order, falling back to position='any' when nothing more
+// specific matches.
 const childBracketSchema = new mongoose.Schema({
   label: String,               // "0–3 sharing", "4–11 yrs", "12–17"
   minAge: { type: Number, default: 0 },
@@ -20,6 +25,14 @@ const childBracketSchema = new mongoose.Schema({
     type: String,
     enum: ['sharing_with_adults', 'own_room', 'any'],
     default: 'sharing_with_adults',
+  },
+  // Sibling position when the rate card distinguishes "1st child" vs "2nd
+  // child" (e.g. Aldiana: "1st child 4–11.99 free, 2nd child 4–11.99 50%").
+  // 'any' (default) preserves legacy age-only matching.
+  position: {
+    type: String,
+    enum: ['any', 'first', 'second', 'third_plus'],
+    default: 'any',
   },
 }, { _id: false });
 
@@ -56,6 +69,13 @@ const roomPricingSchema = new mongoose.Schema({
   triplePerPerson: { type: Number, default: 0 },      // triple: per-person OR room total depending on pricingMode
   quadPerPerson: { type: Number, default: 0 },        // quad: per-person OR room total depending on pricingMode
   singleSupplement: { type: Number, default: 0 },     // only meaningful in per_person mode (solo using a double)
+  // Some rate cards publish "Triple Supplement 100%" / "Quad Supplement 80%"
+  // as a percentage of perPersonSharing rather than an explicit per-person
+  // number. Resolver uses these only when triplePerPerson / quadPerPerson is
+  // 0 (i.e., the PDF gave the % instead of an absolute price).
+  // Aldiana Kwanza is the canonical case ("Triple Supplement 100%").
+  tripleSupplementPct: { type: Number, default: 0 },
+  quadSupplementPct: { type: Number, default: 0 },
   childBrackets: [childBracketSchema],
   // Optional length-of-stay tiers. Leave empty when one price covers any
   // stay length. When populated, the base fields above should hold the
@@ -158,11 +178,75 @@ const passThroughFeeSchema = new mongoose.Schema({
   notes: String,
 }, { _id: false });
 
+// Real-world cancellation policies are written three different ways:
+//   'pct'    — "30% of total" (chains, Western contracts)
+//   'nights' — "1 night charge", "3 nights" (Aldiana Kwanza, EA all-inclusives)
+//   'flat'   — "USD 250 admin fee" (rare, but it happens)
+// `penaltyPct` is kept for back-compat: when penaltyMode is 'pct' the resolver
+// reads penaltyPct; when 'nights' it reads penaltyNights and converts using
+// the stay's average nightly rate; when 'flat' it reads penaltyAmount in the
+// rate list's currency. Existing data with no penaltyMode is treated as 'pct'.
 const cancellationTierSchema = new mongoose.Schema({
   daysBefore: { type: Number, required: true },      // e.g. 60, 30, 14, 7
-  penaltyPct: { type: Number, required: true },      // % of total forfeited
+  penaltyMode: {
+    type: String,
+    enum: ['pct', 'nights', 'flat'],
+    default: 'pct',
+  },
+  penaltyPct: { type: Number, default: 0 },          // used when penaltyMode='pct'
+  penaltyNights: { type: Number, default: 0 },       // used when penaltyMode='nights'
+  penaltyAmount: { type: Number, default: 0 },       // used when penaltyMode='flat' (in rate list currency)
   notes: String,
 }, { _id: false });
+
+// ─── Conditions ─────────────────────────────────────────────────────────
+// A typed callout for any rule that doesn't fit a numeric field but the
+// quote MUST surface. Sources are usually a second-doc PDF that refines
+// the first ("$40 if pax > 2", "min 3 nights at Easter", "kid rate only
+// when sharing"). Resolver evaluates `when` against the booking and either
+// (a) auto-applies `effect` when present and severity != 'blocking', or
+// (b) attaches the condition to the priced result so the renderer shows a
+// callout / blocks send until acknowledged.
+const conditionWhenSchema = new mongoose.Schema({
+  minPax: { type: Number, default: null },
+  maxPax: { type: Number, default: null },
+  minNights: { type: Number, default: null },
+  maxNights: { type: Number, default: null },
+  dateRanges: [dateRangeSchema],
+  nationality: { type: String, default: '' },        // 'citizen' | 'resident' | 'nonResident' | ''
+  roomTypes: { type: [String], default: [] },
+}, { _id: false });
+
+const conditionEffectSchema = new mongoose.Schema({
+  // Dot-path within the rate list / fee / supplement to override.
+  // Examples: "passThroughFees[Mara Reserve Fee].flatAmount",
+  //           "rooms[Standard].perPersonSharing".
+  // The resolver tries to apply structured effects first; bare text-only
+  // conditions still get rendered for the operator.
+  field: { type: String, default: '' },
+  value: { type: Number, default: null },
+  percentDelta: { type: Number, default: null },
+}, { _id: false });
+
+const conditionSchema = new mongoose.Schema({
+  scope: {
+    type: String,
+    enum: ['rate', 'fee', 'child', 'cancellation', 'addon', 'supplement', 'general'],
+    default: 'general',
+  },
+  attachTo: { type: String, default: '' },           // optional named target ("Mara Reserve Fee")
+  when: { type: conditionWhenSchema, default: () => ({}) },
+  effect: { type: conditionEffectSchema, default: () => ({}) },
+  text: { type: String, required: true },            // human-readable rule (always required)
+  severity: {
+    type: String,
+    enum: ['info', 'warning', 'blocking'],
+    default: 'warning',
+  },
+  source: { type: String, default: '' },             // filename or note describing where it came from
+  extractedAt: { type: Date, default: Date.now },
+  acknowledged: { type: Boolean, default: false },
+}, { _id: true });
 
 // A rate list = one price sheet. Audience + currency + validity + priority
 // + meal plan + seasons. A hotel can have many (Rack + STO + Resident + a
@@ -196,7 +280,33 @@ const rateListSchema = new mongoose.Schema({
   inclusions: { type: [String], default: [] },
   exclusions: { type: [String], default: [] },
   notes: { type: String, default: '' },
+  // Typed callouts the renderer must surface and (where structured) the
+  // resolver may auto-apply. Populated from PDFs that refine an existing
+  // rate list — e.g. a policies doc that says "$40 if group > 2" lands here
+  // because the schema has no native group-size dimension.
+  conditions: { type: [conditionSchema], default: [] },
+  // Extraction confidence at rate-list granularity. Set by the PDF prompt
+  // based on how cleanly it could parse the doc. Low = prominent operator
+  // review banner before the list can be used in a quote.
+  extractionConfidence: {
+    type: String,
+    enum: ['high', 'medium', 'low', ''],
+    default: '',
+  },
   isActive: { type: Boolean, default: true },
+}, { _id: true });
+
+// Staged field-level changes from a multi-doc upload that conflict with
+// stored values. Surfaced in the modal's diff approval UI; the operator
+// accepts/rejects each before commit. Cleared as items are resolved.
+const pendingUpdateSchema = new mongoose.Schema({
+  rateListName: { type: String, default: '' },      // empty = hotel-level field
+  fieldPath: { type: String, required: true },      // dot path, e.g. "depositPct" or "passThroughFees[Mara].flatAmount"
+  oldValue: { type: mongoose.Schema.Types.Mixed },
+  newValue: { type: mongoose.Schema.Types.Mixed },
+  source: { type: String, default: '' },
+  extractedAt: { type: Date, default: Date.now },
+  status: { type: String, enum: ['pending', 'accepted', 'rejected', 'deferred'], default: 'pending' },
 }, { _id: true });
 
 // ─── Hotel ──────────────────────────────────────────────────────────────
@@ -237,7 +347,26 @@ const hotelSchema = new mongoose.Schema({
   currency: { type: String, default: 'USD' },
   tags: [String],
   notes: { type: String, default: '' },
+  // Field-level changes from a second PDF upload that conflict with stored
+  // values. Awaiting operator approval before they're applied to the hotel
+  // / rate lists. See pendingUpdateSchema.
+  pendingUpdates: { type: [pendingUpdateSchema], default: [] },
   isActive: { type: Boolean, default: true },
+
+  // ── Pass-3 search embedding ────────────────────────────────────────────
+  // Voyage AI semantic vector for "vibe" queries ("luxury tented camp",
+  // "kid-friendly lodge"). Populated by the backfill script and on hotel
+  // POST/PUT when the source content changes.
+  //   embeddingV1            — the vector itself (length = EMBEDDING_DIMS in services/embeddings.js)
+  //   embeddingV1Model       — model id used to produce it (so we can rotate models cleanly)
+  //   embeddingV1SourceHash  — sha1 of the source text; re-embed only when this changes
+  //   embeddingV1UpdatedAt   — timestamp of the last successful embed
+  // Searched via Atlas $vectorSearch index 'hotel_embeddings_v1' — see
+  // scripts/backfillEmbeddings.js for index setup.
+  embeddingV1: { type: [Number], default: undefined, select: false },
+  embeddingV1Model: { type: String, default: '' },
+  embeddingV1SourceHash: { type: String, default: '' },
+  embeddingV1UpdatedAt: { type: Date },
 }, { timestamps: true });
 
 hotelSchema.index({ organization: 1, destination: 1 });

@@ -142,16 +142,38 @@ function allocateRooms({ adults = 2, childAges = [], rooms }) {
 }
 
 // ─── Child pricing ─────────────────────────────────────────────────────
-function pickBracket(brackets = [], age, inOwnRoom) {
-  const candidates = brackets.filter(b => age >= (b.minAge ?? 0) && age <= (b.maxAge ?? 17));
+// `position` is the child's ordinal in the slot ('first', 'second', 'third_plus')
+// and lets us honor "1st child free, 2nd child 50%" rules. Brackets with
+// position='any' (the default) match any ordinal — that's the legacy path
+// and also serves as the fallback when no position-specific bracket fits.
+function pickBracket(brackets = [], age, inOwnRoom, position = 'any') {
+  const candidates = (brackets || []).filter(b => age >= (b.minAge ?? 0) && age <= (b.maxAge ?? 17));
   if (!candidates.length) return null;
-  // Prefer bracket matching sharing rule if one exists
-  const byRule = candidates.find(b => {
+  const sharingMatch = (b) => {
     if (b.sharingRule === 'any') return true;
     if (inOwnRoom) return b.sharingRule === 'own_room';
     return b.sharingRule === 'sharing_with_adults';
-  });
-  return byRule || candidates[0];
+  };
+  // Position 'first'/'second'/'third_plus' wins over 'any' when both fit.
+  // Within each tier we still prefer the sharingRule match.
+  const positionMatches = candidates.filter(b => (b.position || 'any') === position);
+  if (positionMatches.length) {
+    return positionMatches.find(sharingMatch) || positionMatches[0];
+  }
+  const anyPos = candidates.filter(b => (b.position || 'any') === 'any');
+  if (anyPos.length) {
+    return anyPos.find(sharingMatch) || anyPos[0];
+  }
+  // Last resort: any bracket that matched the age, even if its position was
+  // for a different ordinal — better to apply something than to drop the kid.
+  return candidates.find(sharingMatch) || candidates[0];
+}
+
+// Map the i-th child (sorted oldest→youngest) to a position label.
+function positionFor(index) {
+  if (index === 0) return 'first';
+  if (index === 1) return 'second';
+  return 'third_plus';
 }
 
 // Returns the per-person-equivalent of a sharing rate. In per_person mode
@@ -164,7 +186,14 @@ function effectivePerPerson(roomPricing) {
 }
 
 function childCost(bracket, roomPricing, inOwnRoom) {
-  if (!bracket) return { amount: 0, mode: 'missing_bracket' };
+  if (!bracket) {
+    // No bracket matched the child's age. Operators typically only define
+    // brackets for the discounted ages (e.g. [0-3 free, 4-11 50%]) and treat
+    // anyone older as a paying adult. Charging zero here would silently
+    // under-price; charge the same rate an adult sharing the same room would.
+    const base = inOwnRoom ? (roomPricing.singleOccupancy || 0) : effectivePerPerson(roomPricing);
+    return { amount: base, mode: 'no_bracket_adult_rate' };
+  }
   if (bracket.mode === 'free') return { amount: 0, mode: 'free' };
   if (bracket.mode === 'flat') return { amount: Number(bracket.value) || 0, mode: 'flat' };
   // pct: apply against effective per-person rate (sharing) or singleOccupancy (own room)
@@ -196,7 +225,20 @@ function priceRoomSlot(slot, roomPricing, childAges) {
       triple: 'triplePerPerson',
       quad: 'quadPerPerson',
     }[slot.occupancy];
-    const stored = roomPricing[storageKey] || roomPricing.perPersonSharing || 0;
+    let stored = roomPricing[storageKey] || 0;
+    // Some rate cards publish "Triple Supplement 100%" as a percentage of
+    // perPersonSharing rather than an absolute number. When the explicit
+    // per-person value is missing/zero AND a supplement % exists, derive
+    // the per-person rate as perPersonSharing * (1 + pct/100). We only do
+    // this in per_person mode — per_room_total cards always quote totals.
+    if (!isPerRoom && !stored) {
+      if (slot.occupancy === 'triple' && roomPricing.tripleSupplementPct) {
+        stored = (roomPricing.perPersonSharing || 0) * (1 + (roomPricing.tripleSupplementPct / 100));
+      } else if (slot.occupancy === 'quad' && roomPricing.quadSupplementPct) {
+        stored = (roomPricing.perPersonSharing || 0) * (1 + (roomPricing.quadSupplementPct / 100));
+      }
+    }
+    if (!stored) stored = roomPricing.perPersonSharing || 0;
     if (slot.adults) {
       if (isPerRoom) {
         // Stored value is the whole room's nightly total. One charge per room,
@@ -218,15 +260,17 @@ function priceRoomSlot(slot, roomPricing, childAges) {
 
   // Children assigned to this slot: assume they share with adults unless slot has no adults.
   const kidsInOwnRoom = slot.adults === 0;
-  // We need the actual ages for the kids assigned — but allocateRooms only
-  // tracks counts, not ages. Use ages from the incoming list greedily.
-  // Caller must pass remaining child ages via closure or we flatten elsewhere.
-  // For clarity, accept child ages as a parameter here (caller splits).
-  for (const age of childAges) {
-    const bracket = pickBracket(roomPricing.childBrackets, age, kidsInOwnRoom);
+  // Sort kids oldest→youngest so position-based brackets ("1st child", "2nd
+  // child") apply to the older child first — matches what operators expect
+  // when an Aldiana-style "1st free / 2nd 50%" rule shows up.
+  const sortedAges = [...(childAges || [])].sort((a, b) => b - a);
+  for (let i = 0; i < sortedAges.length; i++) {
+    const age = sortedAges[i];
+    const position = positionFor(i);
+    const bracket = pickBracket(roomPricing.childBrackets, age, kidsInOwnRoom, position);
     const c = childCost(bracket, roomPricing, kidsInOwnRoom);
     base += c.amount;
-    breakdown.push({ kind: `child_${c.mode}`, count: 1, age, perUnit: c.amount, bracketLabel: bracket?.label });
+    breakdown.push({ kind: `child_${c.mode}`, count: 1, age, position, perUnit: c.amount, bracketLabel: bracket?.label });
   }
 
   return { base, breakdown };
@@ -306,7 +350,7 @@ function supplementsForNight(season, date, pax, rooms, rateListCurrency, orgFxOv
 // jumps on Jul 1) gets the correct $/night for each portion of the stay.
 // The old behaviour picked one row for the whole stay and silently dropped
 // fees when the stay straddled a boundary.
-function resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, nightDates) {
+function resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, nightDates, roomCount = 1) {
   const nights = Array.isArray(nightDates) ? nightDates : [];
   const out = [];
 
@@ -316,6 +360,10 @@ function resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, n
   const childKey = nationality === 'citizen' ? 'childCitizen'
                  : nationality === 'resident' ? 'childResident'
                  : 'childNonResident';
+
+  // Defensive — allocateRooms always returns ≥1 slot for a non-empty party,
+  // but a caller passing 0 here would zero out per-room fees silently.
+  const rooms = Math.max(1, Number(roomCount) || 1);
 
   for (const fee of (rateList.passThroughFees || [])) {
     const feeCurrency = fee.currency || rateList.currency;
@@ -337,9 +385,10 @@ function resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, n
         ? pax.childAges.filter(a => a >= (row.childMinAge || 0) && a <= (row.childMaxAge || 17)).length
         : pax.childAges.length;
       if (fee.unit === 'per_room_per_night') {
-        // Approximation: adults proxy rooms until the quote builder surfaces
-        // explicit room counts to the resolver.
-        return adultRate * (pax.adults + pax.childAges.length);
+        // One charge per room, not per pax. Caller passes the actual room
+        // count from allocateRooms; the previous "adults proxy rooms" path
+        // multiplied by total pax and over-charged 4-pax-in-1-room parties.
+        return adultRate * rooms;
       }
       return adultRate * pax.adults + childRate * childEligible;
     };
@@ -387,6 +436,91 @@ function resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, n
     });
   }
   return out;
+}
+
+// ─── Conditions ────────────────────────────────────────────────────────
+// A condition's `when` is a structured matcher. We evaluate it against the
+// booking context and return whether it applies. Empty/null fields on
+// `when` are treated as wildcards. Date ranges are OR'd: any night of the
+// stay falling inside any range counts as a match.
+function conditionApplies(when, ctx) {
+  if (!when) return true;
+  const totalPax = (ctx.adults || 0) + (ctx.childAges || []).length;
+  if (when.minPax != null && totalPax < when.minPax) return false;
+  if (when.maxPax != null && totalPax > when.maxPax) return false;
+  if (when.minNights != null && ctx.nights < when.minNights) return false;
+  if (when.maxNights != null && ctx.nights > when.maxNights) return false;
+  if (when.nationality && when.nationality !== ctx.nationality) return false;
+  if ((when.roomTypes || []).length && !when.roomTypes.includes(ctx.roomType)) return false;
+  if ((when.dateRanges || []).length) {
+    const anyHit = (ctx.nightDates || []).some(d => dateInRanges(d, when.dateRanges));
+    if (!anyHit) return false;
+  }
+  return true;
+}
+
+// Apply a condition's structured `effect` to the priced result in place.
+// We only auto-apply when severity is non-blocking AND the effect targets a
+// scope/field we know how to mutate safely. Anything else is left to the
+// renderer to surface as a callout.
+function applyConditionEffect(condition, priced, rateList) {
+  const eff = condition.effect || {};
+  if (!eff.field) return false;                 // text-only, nothing to apply
+  if (condition.severity === 'blocking') return false; // blocking conditions never auto-apply
+  const path = String(eff.field);
+  // Supported targets so far:
+  //   "passThroughFees[Name].flatAmount"
+  //   "passThroughFees[Name].tieredRows[0].adultNonResident" (etc.)
+  //   "depositPct"
+  //   "addOns[Name].amount"
+  if (path === 'depositPct' && eff.value != null) {
+    priced.depositPct = eff.value;
+    return true;
+  }
+  const ptMatch = path.match(/^passThroughFees\[(.+?)\]\.(.+)$/);
+  if (ptMatch) {
+    const [, name, sub] = ptMatch;
+    const fee = (priced.passThroughFees || []).find(f => f.name === name);
+    if (!fee) return false;
+    if (sub === 'flatAmount' || sub === 'amount') {
+      if (eff.value != null) fee.amount = eff.value;
+      else if (eff.percentDelta != null) fee.amount = fee.amount * (1 + eff.percentDelta / 100);
+      return true;
+    }
+    return false;
+  }
+  const addonMatch = path.match(/^addOns\[(.+?)\]\.amount$/);
+  if (addonMatch) {
+    const addon = (priced.addOns || []).find(a => a.name === addonMatch[1]);
+    if (addon && eff.value != null) {
+      addon.amount = eff.value;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Walk a rate list's conditions[], decide which apply to this booking,
+// auto-apply structured effects (non-blocking only), and return the matched
+// list for the renderer. Each entry is annotated with `applied: true|false`
+// so the UI can distinguish "we adjusted for this" from "review needed".
+function evaluateConditions(rateList, priced, ctx) {
+  const matched = [];
+  for (const c of (rateList.conditions || [])) {
+    if (!conditionApplies(c.when, ctx)) continue;
+    const applied = applyConditionEffect(c, priced, rateList);
+    matched.push({
+      _id: c._id,
+      scope: c.scope,
+      attachTo: c.attachTo,
+      text: c.text,
+      severity: c.severity,
+      source: c.source,
+      acknowledged: !!c.acknowledged,
+      applied,
+    });
+  }
+  return matched;
 }
 
 // ─── Main entry points ────────────────────────────────────────────────
@@ -554,8 +688,9 @@ export function priceStay({
   }
 
   // Pass-through fees — pass night dates so fees straddling a rate change
-  // (e.g. Jul-1 park fee jump) resolve correctly per-night.
-  const ptFees = resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, nights);
+  // (e.g. Jul-1 park fee jump) resolve correctly per-night. roomCount drives
+  // per_room_per_night fees; allocateRooms returns the actual slots used.
+  const ptFees = resolvePassThroughFees(rateList, checkIn, checkOut, pax, nationality, nights, roomCount);
   const ptFeesConverted = ptFees.map(f => ({
     ...f,
     amountInQuoteCurrency: convert(f.amount, f.currency || rateList.currency, quoteCurrency, orgFxOverrides),
@@ -575,6 +710,58 @@ export function priceStay({
       amountInQuoteCurrency: convert(a.amount, currency, quoteCurrency, orgFxOverrides),
     };
   });
+
+  // Normalize cancellation tiers so every entry carries a mode + a value
+  // the renderer can format. For 'nights' mode we also surface the implied
+  // currency amount using the stay's average nightly rate so quotes can
+  // show a number alongside the "1 night" label.
+  const avgNightlySource = nights.length ? subtotalSource / nights.length : 0;
+  const cancellationTiers = (rateList.cancellationTiers || []).map(t => {
+    const mode = t.penaltyMode || 'pct';
+    const out = {
+      daysBefore: t.daysBefore,
+      penaltyMode: mode,
+      penaltyPct: t.penaltyPct || 0,
+      penaltyNights: t.penaltyNights || 0,
+      penaltyAmount: t.penaltyAmount || 0,
+      notes: t.notes || '',
+    };
+    // Compute an effective amount in the rate list's currency so callers
+    // can display "≈ $X" alongside "1 night" or "30%" without re-doing math.
+    if (mode === 'nights') {
+      out.effectiveAmount = avgNightlySource * (t.penaltyNights || 0);
+    } else if (mode === 'pct') {
+      out.effectiveAmount = subtotalSource * ((t.penaltyPct || 0) / 100);
+    } else if (mode === 'flat') {
+      out.effectiveAmount = t.penaltyAmount || 0;
+    }
+    out.effectiveAmountInQuoteCurrency = out.effectiveAmount * fxRate;
+    return out;
+  });
+
+  // Build the priced result first (mutable), evaluate conditions against it,
+  // then return. evaluateConditions can mutate passThroughFees / addOns /
+  // depositPct in place when a condition's effect targets them.
+  const priced = {
+    passThroughFees: ptFeesConverted,
+    addOns,
+    depositPct: rateList.depositPct || 0,
+  };
+  const matchedConditions = evaluateConditions(rateList, priced, {
+    adults: pax.adults,
+    childAges: pax.childAges,
+    nights: nights.length,
+    nightDates: nights,
+    nationality,
+    roomType: nightly.find(n => n.roomType)?.roomType || preferredRoomType || '',
+  });
+  // Surface a hard warning per blocking condition so the operator can't miss
+  // it even if the renderer's callouts get scrolled past.
+  for (const c of matchedConditions) {
+    if (c.severity === 'blocking' && !c.acknowledged) {
+      warnings.push(`BLOCKING condition (acknowledge before sending quote): ${c.text}`);
+    }
+  }
 
   return {
     ok: true,
@@ -604,6 +791,9 @@ export function priceStay({
       mealPlan: rateList.mealPlan,
       mealPlanLabel: rateList.mealPlanLabel,
       priority: rateList.priority,
+      // Surfaced so the editor / quote modal can warn the operator on
+      // low-confidence extractions before the rate is used in client output.
+      extractionConfidence: rateList.extractionConfidence || '',
     },
     roomType: nightly.find(n => n.roomType)?.roomType || preferredRoomType || '',
     nights: nights.length,
@@ -614,8 +804,8 @@ export function priceStay({
     sourceCurrency: rateList.currency,
     quoteCurrency,
     fxRate,
-    passThroughFees: ptFeesConverted,
-    addOns,
+    passThroughFees: priced.passThroughFees,
+    addOns: priced.addOns,
     // Mandatory add-ons that recur per night are already included in each
     // night.total above and therefore in subtotalSource. Surfaced here so the
     // operator UI can attribute the cost ("includes resort fees & conservancy
@@ -624,12 +814,16 @@ export function priceStay({
     // in `warnings` and remain in `addOns` for the operator to line-item.
     mandatoryAddOnsPerNight: mandatoryNightlyBreakdown,
     mandatoryAddOnsPerNightTotal: mandatoryNightlyTotal,
-    cancellationTiers: rateList.cancellationTiers || [],
-    depositPct: rateList.depositPct || 0,
+    cancellationTiers,
+    depositPct: priced.depositPct,
     bookingTerms: rateList.bookingTerms || '',
     inclusions: rateList.inclusions || [],
     exclusions: rateList.exclusions || [],
     notes: rateList.notes || '',
+    // Conditions matched against this booking, with `applied` flag and
+    // severity/acknowledged so the renderer can callout / block send.
+    conditions: matchedConditions,
+    extractionConfidence: rateList.extractionConfidence || '',
     warnings,
   };
 }

@@ -195,12 +195,19 @@ router.post('/', protect, authorize('owner', 'admin', 'agent'), requireQuoteQuot
 // Whitelist of fields a caller can modify on an existing quote. Anything else
 // (organization, createdBy, quoteNumber, shareToken, tracking, etc.) is
 // dropped — preventing cross-tenant moves and identity spoofing via PUT body.
+//
+// Keep this in sync with the schema in models/Quote.js. Top-level only —
+// nested fields (e.g. travelers.adults, pricing.currency) ride along when
+// their parent object is whitelisted.
 const QUOTE_EDITABLE_FIELDS = [
-  'title', 'tripTitle', 'startDate', 'endDate', 'startPoint', 'endPoint',
-  'travelers', 'adults', 'childAges', 'clientType', 'nationality',
-  'currency', 'days', 'pricing', 'inclusions', 'exclusions', 'notes',
+  'title', 'tourType', 'startDate', 'endDate', 'startPoint', 'endPoint',
+  'travelers', 'clientType', 'nationality',
+  'days', 'coverImage', 'blocks', 'pricing',
+  'inclusions', 'exclusions', 'paymentTerms',
   'coverNarrative', 'closingNote', 'highlights', 'pdfStyle', 'coverLayout',
   'brandingSnapshot', 'shareSettings', 'status',
+  'packageSnapshot',
+  'isTemplate', 'templateName', 'templateDescription',
   'contact', 'deal',
 ];
 
@@ -231,6 +238,31 @@ router.put('/:id', protect, authorize('owner', 'admin', 'agent'), async (req, re
     // If user is moving the quote to a different deal, they must also have access to the target.
     if (body.deal && String(body.deal) !== String(prior.deal || '') && !(await canLinkToDeal(req.user, body.deal))) {
       return res.status(403).json({ message: 'No access to the target deal' });
+    }
+
+    // Block transitioning a quote to status='sent' if any day's hotel snapshot
+    // carries an unacknowledged blocking condition. This is the safety rail
+    // for the multi-doc upload flow: a refining PDF can flag a rule the
+    // operator MUST confirm (visa requirement, group-size pricing, blackout
+    // date) and we never want a client quote going out under it unseen.
+    if (prior.status !== 'sent' && body.status === 'sent') {
+      const fullPrior = await Quote.findOne({ _id: req.params.id, organization: req.organizationId }).select('days').lean();
+      const days = body.days || fullPrior?.days || [];
+      const offenders = [];
+      for (const d of days) {
+        for (const c of (d?.hotel?.conditions || [])) {
+          if (c.severity === 'blocking' && !c.acknowledged) {
+            offenders.push({ hotel: d.hotel?.name, text: c.text });
+          }
+        }
+      }
+      if (offenders.length) {
+        return res.status(409).json({
+          message: 'Quote has unacknowledged blocking conditions. Acknowledge them in the hotel\'s Conditions tab before sending.',
+          code: 'BLOCKING_CONDITIONS_UNACKNOWLEDGED',
+          offenders,
+        });
+      }
     }
     const update = Object.keys(unsetOps).length
       ? { $set: body, $unset: unsetOps }
@@ -513,7 +545,7 @@ router.get('/share/:token', async (req, res) => {
       _id: full._id,
       quoteNumber: full.quoteNumber,
       title: full.title,
-      tripTitle: full.tripTitle,
+      tourType: full.tourType,
       version: full.version,
       status: full.status,
       startDate: full.startDate,
@@ -521,13 +553,16 @@ router.get('/share/:token', async (req, res) => {
       startPoint: full.startPoint,
       endPoint: full.endPoint,
       travelers: full.travelers,
-      adults: full.adults,
-      childAges: full.childAges,
-      currency: full.currency,
+      clientType: full.clientType,
+      nationality: full.nationality,
       days: full.days,
+      coverImage: full.coverImage,
+      blocks: full.blocks,
       pricing: safePricing,
       inclusions: full.inclusions,
       exclusions: full.exclusions,
+      paymentTerms: full.paymentTerms,
+      packageSnapshot: full.packageSnapshot,
       coverNarrative: full.coverNarrative,
       closingNote: full.closingNote,
       highlights: full.highlights,

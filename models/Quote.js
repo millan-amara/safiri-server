@@ -127,6 +127,13 @@ const quoteSchema = new mongoose.Schema({
       total: Number,
     }],
 
+    // Whether the global margin should be applied to mandatory pass-through
+    // fees (park fees, conservancy access). Some operators bill these at face
+    // value because they are paid directly to the park / government; others
+    // mark them up like the rest of inventory. Default is to mark up so the
+    // behavior matches every other item in the cost basis.
+    markupPassThroughFees: { type: Boolean, default: true },
+
     // FX snapshot — locks the conversion rates used when this quote's prices
     // were calculated, so a later FX move doesn't silently rewrite the total.
     // Keys are source currencies; values are "1 unit of source = N units of quote currency".

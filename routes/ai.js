@@ -604,6 +604,10 @@ Generate the full itinerary as JSON.`;
               rateListNotes: priced.notes || '',
               inclusions: priced.inclusions || [],
               exclusions: priced.exclusions || [],
+              // Conditions matched against this booking — surfaced on the
+              // share page / PDF and gate quote send when severity=blocking.
+              conditions: priced.conditions || [],
+              extractionConfidence: priced.extractionConfidence || priced.rateList?.extractionConfidence || '',
               warnings: priced.warnings,
             };
           } else {

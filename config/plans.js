@@ -10,6 +10,7 @@ export const AI_CREDIT_COST = {
   heavy: 50,   // /ai/draft-itinerary, /ai/generate-all-narratives (Sonnet 4.6, large output)
   medium: 5,   // /ai/generate-narrative, /ai/suggest-route, /ai/draft-scheduled-message (Haiku, modest output)
   light: 1,    // /ai/draft-email, /ai/deal-summary, /ai/map-columns (Haiku, small output)
+  search: 1,   // /search natural-language partner lookup (Haiku, ~400 output tokens, system prompt cached)
 };
 
 // Sentinel for "unlimited" — used for seats, quotes, partner records on higher tiers.

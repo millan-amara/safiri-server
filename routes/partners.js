@@ -11,6 +11,7 @@ import { requirePartnerQuota, enforceImageCap, enforceCsvRowCap } from '../middl
 import { priceStay } from '../services/rateResolver.js';
 import { priceActivity } from '../services/activityPricer.js';
 import { priceTransport } from '../services/transportPricer.js';
+import { ensureHotelEmbedding } from '../services/embeddings.js';
 import { checkPdfPages } from '../middleware/subscription.js';
 import { logAiCall, recordAiUsage } from '../utils/aiLogger.js';
 
@@ -77,6 +78,10 @@ router.post('/hotels', protect, authorize('owner', 'admin', 'agent'), requirePar
       }
     }
     const hotel = await Hotel.create({ ...req.body, organization: req.organizationId });
+    // Fire-and-forget: re-embed for vector search. Skips internally when the
+    // source hash hasn't changed; failures are logged, not surfaced to the
+    // operator (semantic search is enhancement, not core).
+    ensureHotelEmbedding(hotel).catch(() => {});
     res.status(201).json(hotel);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -91,6 +96,7 @@ router.put('/hotels/:id', protect, authorize('owner', 'admin', 'agent'), enforce
       { new: true, runValidators: true }
     );
     if (!hotel) return res.status(404).json({ message: 'Hotel not found' });
+    ensureHotelEmbedding(hotel).catch(() => {});
     res.json(hotel);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -277,8 +283,10 @@ Each HotelObject follows this schema:
               "quadPerPerson": number,
               "singleSupplement": number,
               "childBrackets": [
-                { "label": "0-3", "minAge": 0, "maxAge": 3, "mode": "free" | "pct" | "flat", "value": number, "sharingRule": "sharing_with_adults" | "own_room" | "any" }
+                { "label": "0-3", "minAge": 0, "maxAge": 3, "mode": "free" | "pct" | "flat", "value": number, "sharingRule": "sharing_with_adults" | "own_room" | "any", "position": "any" | "first" | "second" | "third_plus" }
               ],
+              "tripleSupplementPct": number,    // OPTIONAL — when the PDF says "Triple Supplement 100%" instead of giving a per-person price
+              "quadSupplementPct": number,      // OPTIONAL — same idea for quads
               "stayTiers": [
                 { "minNights": 1, "maxNights": 3, "singleOccupancy": number, "perPersonSharing": number, "triplePerPerson": number, "quadPerPerson": number, "singleSupplement": number },
                 { "minNights": 4, "maxNights": 6, "singleOccupancy": number, "perPersonSharing": number, "triplePerPerson": number, "quadPerPerson": number, "singleSupplement": number },
@@ -303,11 +311,19 @@ Each HotelObject follows this schema:
           "mandatory": true }
       ],
       "cancellationTiers": [
-        { "daysBefore": 60, "penaltyPct": 25 },
-        { "daysBefore": 30, "penaltyPct": 50 }
+        { "daysBefore": 60, "penaltyMode": "pct", "penaltyPct": 25 },
+        { "daysBefore": 21, "penaltyMode": "nights", "penaltyNights": 1 },
+        { "daysBefore": 14, "penaltyMode": "nights", "penaltyNights": 2 },
+        { "daysBefore": 7,  "penaltyMode": "nights", "penaltyNights": 3 },
+        { "daysBefore": 0,  "penaltyMode": "pct", "penaltyPct": 100 }
       ],
       "inclusions": ["Full-board - all meals & accommodation", "Soft drinks, local beers, house wines", "Shared game drives", "VAT & taxes"],
-      "exclusions": ["Daily conservation fees", "Premium spirits, wines, Champagne", "Massages & treatments", "Gratuities to staff & guides"]
+      "exclusions": ["Daily conservation fees", "Premium spirits, wines, Champagne", "Massages & treatments", "Gratuities to staff & guides"],
+      "conditions": [
+        { "scope": "fee", "attachTo": "Mara Reserve Fee", "when": { "minPax": 3 }, "effect": { "field": "passThroughFees[Mara Reserve Fee].flatAmount", "value": 40 }, "text": "Reserve fee drops to USD 40/pp/day for groups of 3 or more.", "severity": "info", "source": "policies-2026.pdf" },
+        { "scope": "child", "text": "Child rate only applies when sharing parents' room — own-room kids pay the adult single rate.", "severity": "warning" }
+      ],
+      "extractionConfidence": "high"
     }
   ]
 }
@@ -347,7 +363,12 @@ Rules:
 - CHILD AGE BRACKETS — inclusive boundaries: "6 years old and younger" or "Up to 6 years" → minAge=0, maxAge=6. "Between 7-15 years old" → minAge=7, maxAge=15. "16 years old and older" → adult, create no bracket. A standalone "6 years old" line with "Free of charge" next to it is ambiguous — interpret as minAge=0, maxAge=6 and add a warning so the operator can confirm.
 - UNUSUAL OCCUPANCY COLUMNS: when a PDF prices a suite/villa as "Per Suite (Max N)" with a separate "5th Adult Sharing" / "Nth Adult" column that's BEYOND the base max-occupancy, treat it as pricingMode="per_room_total", set maxOccupancy=N, and put the extra-adult rate in triplePerPerson ONLY if N=2 (standard triple-beyond-double). For larger suites (Max 4 with a 5th-adult column), put the 5th-adult amount in the room's notes field and add a warning — the schema has no native 5th-pax slot.
 - TRIPLE-ONLY-FOR-CHILD CONSTRAINT: if the PDF restricts triple occupancy to families ("triples only if 3rd person is a child"), still encode triplePerPerson with the quoted dollar amount, and add a warning like "Camp X triple applies only when 3rd person is a child — enforce at booking time".
-- DISCONTINUOUS VALIDITY: A single price row often covers multiple separate date windows ("03 January - 31 March | 01 - 15 June"). Emit ALL of those as separate entries in ONE season's dateRanges array — do NOT create multiple seasons when the prices are identical. Seasons with "Not Applicable" or a closure note should be omitted entirely from dateRanges for that period.`;
+- DISCONTINUOUS VALIDITY: A single price row often covers multiple separate date windows ("03 January - 31 March | 01 - 15 June"). Emit ALL of those as separate entries in ONE season's dateRanges array — do NOT create multiple seasons when the prices are identical. Seasons with "Not Applicable" or a closure note should be omitted entirely from dateRanges for that period.
+- CANCELLATION IN NIGHTS, NOT PERCENT: many EA / Zanzibar / all-inclusive contracts charge cancellation in NIGHTS, not %. Examples: "21 days prior — 01 Night", "14 days — 02 Nights", "07 days — 03 Nights", "No-show: 03 nights for low/mid, 04 nights for high/peak". When you see this, set penaltyMode="nights" and penaltyNights=N. Use penaltyMode="pct" + penaltyPct only when the PDF actually says a percentage. Use penaltyMode="flat" + penaltyAmount for fixed admin fees. Always include a final 100% / same-day tier when the PDF specifies one.
+- TRIPLE / QUAD SUPPLEMENT AS PERCENT: when the PDF expresses the third/fourth person rate as a percentage of base ("Triple Supplement 100%", "Quad Supplement 80%") rather than an absolute number, populate tripleSupplementPct / quadSupplementPct on the room and leave triplePerPerson / quadPerPerson at 0. The resolver computes the per-person rate as perPersonSharing × (1 + pct/100). If the PDF gives BOTH (rare), prefer the absolute number and add a warning.
+- POSITION-BASED CHILD RULES: if the PDF distinguishes between "1st child" and "2nd child" with different prices ("1st child 4–11.99 free of charge, 2nd child 4–11.99 charged 50% off half-twin rate" — Aldiana Kwanza), emit ONE bracket per (age range, ordinal) with position="first" / "second" / "third_plus". Default position is "any" — use it for ordinary age-only rules. Do NOT collapse position-based rules into a single average; the ordinal distinction is real money.
+- CONDITIONS — anything that doesn't fit a typed slot: when the PDF expresses a rule that the schema can't natively represent (group-size-based pricing — "$40 if pax > 2", minimum-stay rules tied to dates — "min 3 nights at Easter", restrictions — "kid rate only when sharing parents' room", surcharges by booking source, weather/operational notes the client must see), emit a condition entry on the rate list. ALWAYS provide a clear text field (the human-readable rule). When confidently parseable, also fill the "when" matcher (minPax/maxPax/minNights/maxNights/dateRanges/nationality/roomTypes) and the "effect" block (field path + value or percentDelta) so the resolver can auto-apply. Set severity to: "info" for nice-to-know; "warning" for review-recommended; "blocking" for rules the operator MUST acknowledge before sending the quote (e.g. visa requirements, minimum-deposit constraints). Always set source to the original document name if known.
+- EXTRACTION CONFIDENCE: set extractionConfidence per rate list to "high" when the document was a clean structured rate sheet you parsed end-to-end without ambiguity; "medium" when you had to interpret column layouts, infer pricingMode, or extract from a multi-table layout with some assumption; "low" when the document was scanned-quality, partial, contradictory, or you guessed key fields. Be honest — operators rely on this flag to decide whether to spot-check the list manually before sending a quote.`;
 
       const userText = [
         'Extract the hotel rate card from this PDF into the JSON schema above.',
@@ -681,6 +702,165 @@ router.delete('/packages/:id', protect, authorize('owner', 'admin', 'agent'), as
 // record has none (never clobbers operator-entered values).
 // Same merge semantics for hotels: append rate lists by name, fill shared
 // contract/policy fields only where the existing record is blank.
+// Deep reconcile rather than name-skip dedupe. When a second PDF lands on
+// an already-saved hotel, we want:
+//   - rate lists with brand-new names → append (legacy behavior)
+//   - rate lists with matching names → merge field-by-field:
+//       * identical values → no-op
+//       * existing blank, new has value → fill
+//       * conflicting non-blank values → record a pendingUpdate for operator
+//         approval; do NOT clobber stored data
+//   - extracted conditions[] → append to the matched list's conditions,
+//     deduped by `text`
+//   - hotel-level description / amenities → fill blank, union arrays
+// Returns { appendedListNames, mergedListNames, pendingUpdates } so the UI
+// can show a precise summary of what changed and what needs approval.
+function isBlank(v) {
+  if (v == null) return true;
+  if (typeof v === 'string') return v.trim() === '';
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === 'number') return v === 0;
+  return false;
+}
+
+function recordConflict(pending, rateListName, fieldPath, oldValue, newValue, source) {
+  pending.push({
+    rateListName: rateListName || '',
+    fieldPath,
+    oldValue,
+    newValue,
+    source: source || '',
+    extractedAt: new Date(),
+    status: 'pending',
+  });
+}
+
+// Reconcile two rate lists. Returns { filled, pending } — array of fields
+// auto-filled (for the toast summary) and conflicts staged for review.
+function reconcileRateList(existing, incoming, source) {
+  const filled = [];
+  const pending = [];
+  const listName = existing.name;
+
+  // Top-level scalars where filling-blank is safe.
+  const scalarFields = ['mealPlan', 'mealPlanLabel', 'depositPct', 'bookingTerms', 'currency'];
+  for (const f of scalarFields) {
+    const oldV = existing[f];
+    const newV = incoming[f];
+    if (newV == null || newV === '') continue;
+    if (isBlank(oldV)) {
+      existing[f] = newV;
+      filled.push(f);
+    } else if (oldV !== newV) {
+      recordConflict(pending, listName, f, oldV, newV, source);
+    }
+  }
+
+  // Validity dates — fill if blank, conflict otherwise.
+  for (const f of ['validFrom', 'validTo']) {
+    if (!incoming[f]) continue;
+    const oldT = existing[f] ? new Date(existing[f]).getTime() : null;
+    const newT = new Date(incoming[f]).getTime();
+    if (oldT == null) { existing[f] = incoming[f]; filled.push(f); }
+    else if (oldT !== newT) recordConflict(pending, listName, f, existing[f], incoming[f], source);
+  }
+
+  // Inclusions / exclusions: dedup union (case-insensitive).
+  for (const f of ['inclusions', 'exclusions']) {
+    const incomingArr = Array.isArray(incoming[f]) ? incoming[f] : [];
+    if (!incomingArr.length) continue;
+    if (!Array.isArray(existing[f])) existing[f] = [];
+    const seen = new Set(existing[f].map(s => String(s).toLowerCase().trim()));
+    const before = existing[f].length;
+    for (const v of incomingArr) {
+      const key = String(v).toLowerCase().trim();
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        existing[f].push(v);
+      }
+    }
+    if (existing[f].length > before) filled.push(f);
+  }
+
+  // Cancellation tiers: union by daysBefore. Same daysBefore + same mode +
+  // same value = no-op; same daysBefore but different value = conflict.
+  if (!Array.isArray(existing.cancellationTiers)) existing.cancellationTiers = [];
+  const tiersByDays = new Map(existing.cancellationTiers.map(t => [t.daysBefore, t]));
+  for (const t of (incoming.cancellationTiers || [])) {
+    if (t.daysBefore == null) continue;
+    const old = tiersByDays.get(t.daysBefore);
+    if (!old) {
+      existing.cancellationTiers.push(t);
+      tiersByDays.set(t.daysBefore, t);
+      filled.push(`cancellationTiers[${t.daysBefore}]`);
+    } else {
+      const sameMode = (old.penaltyMode || 'pct') === (t.penaltyMode || 'pct');
+      const sameVal = sameMode && (
+        (old.penaltyMode === 'nights' && (old.penaltyNights || 0) === (t.penaltyNights || 0)) ||
+        (old.penaltyMode === 'flat' && (old.penaltyAmount || 0) === (t.penaltyAmount || 0)) ||
+        ((old.penaltyMode || 'pct') === 'pct' && (old.penaltyPct || 0) === (t.penaltyPct || 0))
+      );
+      if (!sameVal) recordConflict(pending, listName, `cancellationTiers[${t.daysBefore}]`, old, t, source);
+    }
+  }
+
+  // Pass-through fees: union by name.
+  if (!Array.isArray(existing.passThroughFees)) existing.passThroughFees = [];
+  const feesByName = new Map(existing.passThroughFees.map(f => [f.name, f]));
+  for (const f of (incoming.passThroughFees || [])) {
+    if (!f.name) continue;
+    const old = feesByName.get(f.name);
+    if (!old) {
+      existing.passThroughFees.push(f);
+      feesByName.set(f.name, f);
+      filled.push(`passThroughFees[${f.name}]`);
+    } else if ((old.flatAmount || 0) !== (f.flatAmount || 0) || (old.unit || '') !== (f.unit || '')) {
+      recordConflict(pending, listName, `passThroughFees[${f.name}]`, old, f, source);
+    }
+  }
+
+  // Add-ons: union by name.
+  if (!Array.isArray(existing.addOns)) existing.addOns = [];
+  const addOnsByName = new Map(existing.addOns.map(a => [a.name, a]));
+  for (const a of (incoming.addOns || [])) {
+    if (!a.name) continue;
+    const old = addOnsByName.get(a.name);
+    if (!old) {
+      existing.addOns.push(a);
+      addOnsByName.set(a.name, a);
+      filled.push(`addOns[${a.name}]`);
+    } else if ((old.amount || 0) !== (a.amount || 0) || (old.unit || '') !== (a.unit || '')) {
+      recordConflict(pending, listName, `addOns[${a.name}]`, old, a, source);
+    }
+  }
+
+  // Conditions: append, dedup by lowercased text.
+  if (!Array.isArray(existing.conditions)) existing.conditions = [];
+  const condTexts = new Set(existing.conditions.map(c => String(c.text).toLowerCase().trim()));
+  for (const c of (incoming.conditions || [])) {
+    const key = String(c.text || '').toLowerCase().trim();
+    if (!key || condTexts.has(key)) continue;
+    existing.conditions.push({ ...c, source: c.source || source || '' });
+    condTexts.add(key);
+    filled.push('conditions');
+  }
+
+  // Confidence: take the LOWER of the two — once a low-confidence doc has
+  // touched a list, the operator should review the whole list.
+  const order = { high: 3, medium: 2, low: 1, '': 0 };
+  const oldC = existing.extractionConfidence || '';
+  const newC = incoming.extractionConfidence || '';
+  if (newC && order[newC] < order[oldC]) {
+    existing.extractionConfidence = newC;
+    filled.push('extractionConfidence');
+  } else if (newC && !oldC) {
+    existing.extractionConfidence = newC;
+    filled.push('extractionConfidence');
+  }
+
+  return { filled, pending };
+}
+
 router.put('/hotels/:id/merge-rate-lists', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const hotel = await Hotel.findOne({ _id: req.params.id, organization: req.organizationId });
@@ -690,27 +870,146 @@ router.put('/hotels/:id/merge-rate-lists', protect, authorize('owner', 'admin', 
       rateLists = [],
       description = '',
       amenities = [],
+      source = '',                     // optional: caller passes the PDF filename for traceability
     } = req.body;
 
-    const existingListNames = new Set((hotel.rateLists || []).map(l => l.name));
     const appended = [];
+    const merged = [];
+    const allPending = [];
+    const existingByName = new Map((hotel.rateLists || []).map(l => [l.name, l]));
+
     for (const list of rateLists) {
-      if (!list?.name || existingListNames.has(list.name)) continue;
-      hotel.rateLists.push(list);
-      existingListNames.add(list.name);
-      appended.push(list.name);
+      if (!list?.name) continue;
+      const existing = existingByName.get(list.name);
+      if (!existing) {
+        hotel.rateLists.push(list);
+        existingByName.set(list.name, list);
+        appended.push(list.name);
+        continue;
+      }
+      const { filled, pending } = reconcileRateList(existing, list, source);
+      if (filled.length) merged.push({ name: list.name, filled });
+      allPending.push(...pending);
     }
 
+    // Hotel-level fills: description + amenities.
     if (!hotel.description && description) hotel.description = description;
     if ((!hotel.amenities?.length) && amenities.length) {
       hotel.amenities = amenities;
     } else if (amenities.length) {
-      // Union dedup
       hotel.amenities = Array.from(new Set([...hotel.amenities, ...amenities]));
     }
 
+    if (allPending.length) {
+      hotel.pendingUpdates.push(...allPending);
+    }
+
     await hotel.save();
-    res.json({ hotel, appendedListNames: appended });
+    res.json({
+      hotel,
+      appendedListNames: appended,
+      mergedListNames: merged.map(m => m.name),
+      mergeDetails: merged,
+      pendingUpdates: allPending,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Approve / reject / defer staged pendingUpdates. The operator works through
+// the diff modal in the UI; each decision lands here. Accepted updates are
+// applied to the targeted field; rejected/deferred update statuses are
+// recorded but no field changes. Cleared from the list once status != 'pending'
+// to keep the queue small (history lives in the audit log).
+router.put('/hotels/:id/pending-updates/:updateId', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
+  try {
+    const { decision } = req.body;                 // 'accept' | 'reject' | 'defer'
+    if (!['accept', 'reject', 'defer'].includes(decision)) {
+      return res.status(400).json({ message: 'decision must be accept | reject | defer' });
+    }
+    const hotel = await Hotel.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!hotel) return res.status(404).json({ message: 'Hotel not found' });
+    const update = (hotel.pendingUpdates || []).id(req.params.updateId);
+    if (!update) return res.status(404).json({ message: 'Pending update not found' });
+
+    if (decision === 'accept') {
+      // Apply the new value to the target. Path syntax matches what the
+      // reconcile produces: bare scalar field names ("depositPct"), or
+      // bracketed accessors ("cancellationTiers[21]", "passThroughFees[Mara Reserve Fee]",
+      // "addOns[Drinks]").
+      const list = update.rateListName
+        ? (hotel.rateLists || []).find(l => l.name === update.rateListName)
+        : hotel;
+      if (!list) {
+        update.status = 'rejected';
+        update.notes = 'target rate list missing';
+      } else {
+        const path = update.fieldPath;
+        const bracketed = path.match(/^(\w+)\[(.+?)\](?:\.(.+))?$/);
+        if (!bracketed) {
+          // Bare scalar.
+          list[path] = update.newValue;
+        } else {
+          const [, container, key, subPath] = bracketed;
+          const arr = list[container] || [];
+          if (container === 'cancellationTiers') {
+            const idx = arr.findIndex(t => String(t.daysBefore) === String(key));
+            if (idx >= 0) arr.splice(idx, 1, update.newValue);
+            else arr.push(update.newValue);
+          } else {
+            // name-keyed array
+            const idx = arr.findIndex(x => x.name === key);
+            if (idx >= 0) {
+              if (!subPath) arr.splice(idx, 1, update.newValue);
+              else arr[idx][subPath] = update.newValue;
+            } else {
+              arr.push(update.newValue);
+            }
+          }
+        }
+        update.status = 'accepted';
+      }
+    } else {
+      update.status = decision === 'reject' ? 'rejected' : 'deferred';
+    }
+
+    // Drop resolved (non-pending) entries to keep the queue tight.
+    hotel.pendingUpdates = (hotel.pendingUpdates || []).filter(u => u.status === 'pending');
+    await hotel.save();
+    res.json({ hotel });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Bulk-clear pending updates for the hotel (used by the "Dismiss all" UI button).
+router.delete('/hotels/:id/pending-updates', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
+  try {
+    const hotel = await Hotel.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!hotel) return res.status(404).json({ message: 'Hotel not found' });
+    hotel.pendingUpdates = [];
+    await hotel.save();
+    res.json({ hotel });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Acknowledge a condition on a saved rate list. Blocking conditions stay
+// in the way of quote send until the operator has clicked acknowledge here
+// (or fixed the underlying data).
+router.put('/hotels/:id/rate-lists/:listId/conditions/:conditionId/acknowledge', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
+  try {
+    const hotel = await Hotel.findOne({ _id: req.params.id, organization: req.organizationId });
+    if (!hotel) return res.status(404).json({ message: 'Hotel not found' });
+    const list = (hotel.rateLists || []).id(req.params.listId);
+    if (!list) return res.status(404).json({ message: 'Rate list not found' });
+    const cond = (list.conditions || []).id(req.params.conditionId);
+    if (!cond) return res.status(404).json({ message: 'Condition not found' });
+    cond.acknowledged = true;
+    await hotel.save();
+    res.json({ hotel });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -789,60 +1088,31 @@ router.post('/packages/:id/price', protect, async (req, res) => {
       quoteCurrency,
       clientType = 'retail',
       startDate,
+      preferredMealPlan,
     } = req.body;
-    const { convert, getFxRate } = await import('../utils/fx.js');
 
     const effectiveCurrency = quoteCurrency || req.organization?.defaults?.currency || 'USD';
     const orgFxOverrides = req.organization?.fxRates || {};
-    const warnings = [];
 
-    // ─── Pick the pricing list ─────────────────────────────────────────────
-    const allLists = (pkg.pricingLists || []).filter(l => l.isActive !== false);
-    if (allLists.length === 0) {
-      return res.json({ ok: false, reason: 'no_pricing_lists', warnings });
+    // Delegate to the canonical pricer. Previously this route reimplemented
+    // pricing inline and silently diverged from the service: it hard-failed
+    // on no-matching-pax-tier (the service falls back to the cheapest tier),
+    // and made any child without a matching age bracket free (the service
+    // charges them at the adult rate). One pricer for both code paths.
+    const { pricePackage } = await import('../services/packagePricer.js');
+    const priced = pricePackage({
+      pkg,
+      date: startDate ? new Date(startDate) : new Date(),
+      pax: { adults: Number(adults) || 0, childAges: Array.isArray(childAges) ? childAges : [] },
+      clientType,
+      preferredMealPlan,
+      quoteCurrency: effectiveCurrency,
+      orgFxOverrides,
+    });
+
+    if (!priced.ok) {
+      return res.json({ ok: false, reason: priced.reason, warnings: priced.warnings || [] });
     }
-
-    let eligible = allLists.filter(l => packageListMatchesAudience(l, clientType));
-    if (!eligible.length) {
-      warnings.push(`No pricing list matches clientType=${clientType}. Falling back to any active list.`);
-      eligible = allLists;
-    }
-
-    const dated = eligible.filter(l => packageListCoversDate(l, startDate));
-    if (dated.length) eligible = dated;
-    else if (startDate) warnings.push(`No pricing list covers start date ${startDate}. Using most recent.`);
-
-    const pricing = eligible.slice().sort((a, b) => (b.priority || 0) - (a.priority || 0))[0];
-    if (!pricing) {
-      return res.json({ ok: false, reason: 'no_eligible_pricing_list', warnings });
-    }
-
-    // ─── Pax tier + child breakdown ────────────────────────────────────────
-    const totalPax = Number(adults) + (childAges?.length || 0);
-    const tier = (pricing.paxTiers || []).find(t => totalPax >= (t.minPax || 1) && totalPax <= (t.maxPax || 99));
-    if (!tier) {
-      return res.json({ ok: false, reason: 'no_matching_pax_tier', totalPax, tiers: pricing.paxTiers, warnings });
-    }
-
-    const adultTotal = tier.pricePerPerson * adults;
-    const singleSupplement = (adults === 1 ? (pricing.singleSupplement || 0) : 0);
-    const childrenBreakdown = [];
-    let childTotal = 0;
-    for (const age of childAges) {
-      const bracket = (pricing.childBrackets || []).find(b => age >= (b.minAge ?? 0) && age <= (b.maxAge ?? 17));
-      if (!bracket || bracket.mode === 'free') {
-        childrenBreakdown.push({ age, mode: 'free', amount: 0 });
-        continue;
-      }
-      const amount = bracket.mode === 'flat'
-        ? (bracket.value || 0)
-        : tier.pricePerPerson * (bracket.value || 0) / 100;
-      childTotal += amount;
-      childrenBreakdown.push({ age, mode: bracket.mode, bracketLabel: bracket.label, amount });
-    }
-
-    const subtotalSource = adultTotal + singleSupplement + childTotal;
-    const fxRate = getFxRate(pricing.currency, effectiveCurrency, orgFxOverrides) ?? 1;
 
     // Hydrate segment hotels — segment.hotel is just an ObjectId ref. Without
     // this the client builds package days with empty descriptions/images even
@@ -873,6 +1143,10 @@ router.post('/packages/:id/price', protect, async (req, res) => {
       };
     });
 
+    // Map service output to the response shape the quote builder expects.
+    // Names like `tier`, `adultTotal`, `childTotal`, `childrenBreakdown` are
+    // already consumed by applyPackage and the package snapshot — keep them
+    // stable so this is a behavioral fix, not a contract change.
     res.json({
       ok: true,
       package: {
@@ -885,35 +1159,27 @@ router.post('/packages/:id/price', protect, async (req, res) => {
         tags: pkg.tags || [],
         notes: pkg.notes || '',
       },
-      pricingList: {
-        _id: pricing._id,
-        name: pricing.name,
-        audience: pricing.audience,
-        priority: pricing.priority,
-        mealPlan: pricing.mealPlan,
-        mealPlanLabel: pricing.mealPlanLabel || '',
-        seasonLabel: pricing.seasonLabel || '',
-        notes: pricing.notes || '',
-      },
-      tier,
-      adults,
-      childAges,
-      adultTotal,
-      singleSupplement,
-      childTotal,
-      childrenBreakdown,
-      sourceCurrency: pricing.currency,
-      quoteCurrency: effectiveCurrency,
-      fxRate,
-      subtotalSource,
-      subtotalInQuoteCurrency: subtotalSource * fxRate,
-      inclusions: pricing.inclusions || [],
-      exclusions: pricing.exclusions || [],
+      pricingList: priced.pricingList,
+      tier: priced.paxTier,
+      paxTierFallback: priced.paxTierFallback || false,
+      adults: priced.pax.adults,
+      childAges: priced.pax.childAges,
+      adultTotal: priced.adultsTotal,
+      singleSupplement: priced.singleSupplement,
+      childTotal: priced.childrenTotal,
+      childrenBreakdown: priced.perChildBreakdown,
+      sourceCurrency: priced.sourceCurrency,
+      quoteCurrency: priced.quoteCurrency,
+      fxRate: priced.fxRate,
+      subtotalSource: priced.subtotalSource,
+      subtotalInQuoteCurrency: priced.subtotalInQuoteCurrency,
+      inclusions: priced.inclusions || [],
+      exclusions: priced.exclusions || [],
       segments: populatedSegments,
-      cancellationTiers: pkg.cancellationTiers || [],
-      depositPct: pkg.depositPct || 0,
-      bookingTerms: pkg.bookingTerms || '',
-      warnings,
+      cancellationTiers: priced.cancellationTiers || [],
+      depositPct: priced.depositPct || 0,
+      bookingTerms: priced.bookingTerms || '',
+      warnings: priced.warnings || [],
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
