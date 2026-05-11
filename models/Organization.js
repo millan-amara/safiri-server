@@ -64,6 +64,11 @@ const organizationSchema = new mongoose.Schema({
     // Auto-create a draft invoice when a deal moves to a Won-typed stage.
     // Operators using external accounting (QuickBooks, etc.) can switch off.
     autoGenerateInvoiceOnWon: { type: Boolean, default: true },
+    // Auto-create draft hotel vouchers (one per stay segment) when a deal
+    // moves to Won. Off by default — vouchers can't be auto-issued because
+    // the lodge confirmation number (PRN) needs operator entry; this just
+    // saves the "remember to click Generate" step.
+    autoGenerateVouchersOnWon: { type: Boolean, default: false },
     // Default tax percentage applied to new invoices. Operator overrides per-invoice.
     defaultTaxPercent: { type: Number, default: 0, min: 0, max: 100 },
     // Payment instructions text shown at the bottom of every invoice

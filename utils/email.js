@@ -223,27 +223,57 @@ export function verifyEmailTemplate({ userName, verifyUrl }) {
   `);
 }
 
-export function invoiceEmail({ clientName, invoiceNumber, total, currency, dueDate, paymentInstructions, orgName, message, type }) {
+export function invoiceEmail({ clientName, invoiceNumber, total, currency, dueDate, paymentInstructions, orgName, message, type, amountPaid, amountDue }) {
   const safeName = escapeHtml(clientName || 'there');
   const safeNum = escapeHtml(invoiceNumber);
-  const safeAmount = `${escapeHtml(currency || 'USD')} ${Number(total || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const cur = escapeHtml(currency || 'USD');
+  const fmt = (n) => `${cur} ${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const dateStr = (d) => d ? new Date(d).toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' }) : '';
   const typeLabel = type === 'deposit' ? 'deposit invoice'
     : type === 'balance' ? 'balance invoice'
     : 'invoice';
   const safeMessage = message ? escapeHtml(message).replace(/\n/g, '<br/>') : '';
   const safePay = paymentInstructions ? escapeHtml(paymentInstructions).replace(/\n/g, '<br/>') : '';
-  return wrap(`
-    <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">Your ${typeLabel} is attached</h3>
-    <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">
-      Hi ${safeName}, please find attached ${escapeHtml(typeLabel)} <strong style="color: ${COLORS.text};">${safeNum}</strong>.
-    </p>
-    <div style="margin: 24px 0; padding: 16px; background: ${COLORS.bg}; border-radius: 8px;">
-      <p style="margin: 0; color: ${COLORS.text}; font-size: 14px;"><strong>Amount due:</strong> ${safeAmount}</p>
+
+  // Detect partial-payment state. amountPaid > 0 means payments have been
+  // recorded — the email shifts from "here's your invoice" to "here's the
+  // outstanding balance" so the client doesn't pay the full amount twice.
+  const totalNum = Number(total || 0);
+  const paidNum = Number(amountPaid || 0);
+  const dueNum = amountDue != null ? Number(amountDue) : Math.max(0, totalNum - paidNum);
+  const hasPayments = paidNum > 0.005;
+  const fullyPaid = hasPayments && dueNum <= 0.005;
+
+  const heading = fullyPaid
+    ? `Receipt for ${typeLabel} ${safeNum}`
+    : hasPayments
+      ? `Balance reminder for ${typeLabel} ${safeNum}`
+      : `Your ${typeLabel} is attached`;
+  const intro = fullyPaid
+    ? `Hi ${safeName}, thank you for your payment. ${escapeHtml(typeLabel.charAt(0).toUpperCase() + typeLabel.slice(1))} <strong style="color: ${COLORS.text};">${safeNum}</strong> has been paid in full. The PDF is attached for your records.`
+    : hasPayments
+      ? `Hi ${safeName}, this is a reminder for the outstanding balance on ${escapeHtml(typeLabel)} <strong style="color: ${COLORS.text};">${safeNum}</strong>. The full PDF is attached.`
+      : `Hi ${safeName}, please find attached ${escapeHtml(typeLabel)} <strong style="color: ${COLORS.text};">${safeNum}</strong>.`;
+
+  // Amount block: show outstanding balance prominently when partial; for
+  // fully-paid receipts, swap the framing to "Paid in full".
+  const amountBlock = fullyPaid ? `
+      <p style="margin: 0; color: ${COLORS.text}; font-size: 14px;"><strong>Paid in full:</strong> ${fmt(totalNum)}</p>
+    ` : hasPayments ? `
+      <p style="margin: 0; color: ${COLORS.text}; font-size: 14px;"><strong>Outstanding balance:</strong> ${fmt(dueNum)}</p>
+      <p style="margin: 6px 0 0; color: ${COLORS.muted}; font-size: 13px;">Total ${fmt(totalNum)} · already paid ${fmt(paidNum)}</p>
       ${dueDate ? `<p style="margin: 6px 0 0; color: ${COLORS.text}; font-size: 14px;"><strong>Due:</strong> ${escapeHtml(dateStr(dueDate))}</p>` : ''}
-    </div>
+    ` : `
+      <p style="margin: 0; color: ${COLORS.text}; font-size: 14px;"><strong>Amount due:</strong> ${fmt(totalNum)}</p>
+      ${dueDate ? `<p style="margin: 6px 0 0; color: ${COLORS.text}; font-size: 14px;"><strong>Due:</strong> ${escapeHtml(dateStr(dueDate))}</p>` : ''}
+    `;
+
+  return wrap(`
+    <h3 style="color: ${COLORS.text}; font-size: 18px; margin-bottom: 8px;">${heading}</h3>
+    <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">${intro}</p>
+    <div style="margin: 24px 0; padding: 16px; background: ${COLORS.bg}; border-radius: 8px;">${amountBlock}</div>
     ${safeMessage ? `<p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6;">${safeMessage}</p>` : ''}
-    ${safePay ? `
+    ${safePay && !fullyPaid ? `
       <div style="margin: 16px 0; padding: 12px; border-left: 3px solid ${COLORS.primary}; background: ${COLORS.bg};">
         <p style="margin: 0 0 6px; color: ${COLORS.subtle}; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;">Payment instructions</p>
         <p style="margin: 0; color: ${COLORS.text}; font-size: 13px; line-height: 1.5;">${safePay}</p>

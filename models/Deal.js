@@ -88,7 +88,7 @@ const dealSchema = new mongoose.Schema({
   
   // Activity log (auto-generated system events only)
   activities: [{
-    type: { type: String, enum: ['stage_change', 'quote_sent', 'quote_viewed', 'deal_created', 'assignment_change', 'email_sent'] },
+    type: { type: String, enum: ['stage_change', 'quote_sent', 'quote_viewed', 'deal_created', 'assignment_change', 'email_sent', 'payment_recorded', 'payment_removed'] },
     description: String,
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     createdAt: { type: Date, default: Date.now },

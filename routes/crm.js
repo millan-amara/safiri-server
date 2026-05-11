@@ -10,6 +10,7 @@ import Quote from '../models/Quote.js';
 import { computeSendAt } from './scheduledMessages.js';
 import { buildInvoicePayloadFromDeal, nextInvoiceNumber } from '../services/invoiceBuilder.js';
 import { fireInvoiceWebhook } from '../services/invoiceWebhook.js';
+import { autoGenerateVouchersOnDealWon } from '../services/voucherGenerator.js';
 import { protect, authorize } from '../middleware/auth.js';
 import {
   getAccessiblePipelineIds,
@@ -493,6 +494,70 @@ router.put('/deals/:id', protect, authorize('owner', 'admin', 'agent'), requireD
             }
           } catch (err) {
             console.error('[crm] auto-invoice generation on Won failed:', err.message);
+          }
+        }
+
+        // ── Auto-draft hotel vouchers on Won ───────────────────────────────
+        // Off by default. The auto-generator picks the deal's single LIVE
+        // quote (sent / viewed / accepted) — if there are 0 or >1 it bails
+        // and notifies the operator to do it manually, because picking the
+        // wrong quote could send a stale itinerary to the lodge. Vouchers
+        // are always created as drafts: the lodge PRN still has to be added
+        // by hand before the operator emails them out.
+        if (req.organization?.preferences?.autoGenerateVouchersOnWon === true) {
+          try {
+            const populatedDeal = await Deal.findById(existing._id)
+              .populate('contact', 'firstName lastName email phone company');
+            const outcome = await autoGenerateVouchersOnDealWon({
+              deal: populatedDeal,
+              organizationId: req.organizationId,
+              userId: req.user._id,
+            });
+
+            // Notify the deal closer regardless of outcome so they know what
+            // (if anything) was generated and what they need to do next.
+            const dealLink = { entityType: 'deal', entityId: existing._id };
+            if (outcome.reason === 'created') {
+              const n = outcome.created.length;
+              const skipNote = outcome.skipped > 0 ? ` (${outcome.skipped} skipped — already existed)` : '';
+              createNotification({
+                organization: req.organizationId,
+                user: req.user._id,
+                type: 'system',
+                title: `${n} voucher draft${n === 1 ? '' : 's'} created`,
+                message: `From quote QT-${String(outcome.quoteNumber).padStart(4, '0')}${skipNote}. Confirm with each hotel and add the PRN before issuing.`,
+                ...dealLink,
+              });
+            } else if (outcome.reason === 'multiple_quotes') {
+              createNotification({
+                organization: req.organizationId,
+                user: req.user._id,
+                type: 'system',
+                title: 'Vouchers not auto-generated',
+                message: `Deal has ${outcome.count} live quotes. Open the deal and generate vouchers from the right quote manually.`,
+                ...dealLink,
+              });
+            } else if (outcome.reason === 'no_quote') {
+              createNotification({
+                organization: req.organizationId,
+                user: req.user._id,
+                type: 'system',
+                title: 'Vouchers not auto-generated',
+                message: 'No live quote on this deal. Generate vouchers manually if accommodation needs to be issued.',
+                ...dealLink,
+              });
+            } else if (outcome.reason === 'no_hotels') {
+              createNotification({
+                organization: req.organizationId,
+                user: req.user._id,
+                type: 'system',
+                title: 'No vouchers to generate',
+                message: `Quote QT-${String(outcome.quoteNumber).padStart(4, '0')} has no hotel stays.`,
+                ...dealLink,
+              });
+            }
+          } catch (err) {
+            console.error('[crm] auto-voucher generation on Won failed:', err.message);
           }
         }
       } else if (isLost) {

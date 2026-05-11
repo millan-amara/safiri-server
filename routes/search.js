@@ -14,8 +14,8 @@ import { checkAiCredits } from '../middleware/subscription.js';
 import { logAiCall, recordAiUsage } from '../utils/aiLogger.js';
 import { AI_CREDIT_COST, getPlan } from '../config/plans.js';
 import { parseQuery } from '../services/searchParser.js';
-import { executeSearch } from '../services/searchExecutor.js';
-import { generateRationales } from '../services/searchRationale.js';
+import { executeSearch, executeLookup } from '../services/searchExecutor.js';
+import { generateRationales, generateLookupAnswer } from '../services/searchRationale.js';
 
 const router = Router();
 router.use(protect);
@@ -54,6 +54,67 @@ router.post(
         : null;
       const effectiveParsed = forcedType ? { ...parsed, type: forcedType } : parsed;
 
+      // ── Lookup intent: Q&A about a specific named partner ────────────────
+      // The parser sets intent='lookup' when the operator is asking ABOUT a
+      // partner ("What's Serena's cancellation policy?") rather than searching
+      // for inventory. We resolve the partner, pull topic-specific data, and
+      // generate the answer in this same call so the operator gets one
+      // response with the answer in it. Costs 2 credits total (parser + answer).
+      if (effectiveParsed.intent === 'lookup' && effectiveParsed.subjectName) {
+        const lookupResult = await executeLookup({
+          parsed: effectiveParsed,
+          organizationId: req.organizationId,
+        });
+
+        // Multiple matches — return slim candidates and ask the operator to pick.
+        if (!lookupResult.lookup && lookupResult.candidates.length > 0) {
+          return res.json({
+            intent: 'lookup',
+            parsed: effectiveParsed,
+            lookup: null,
+            candidates: lookupResult.candidates,
+            answer: null,
+          });
+        }
+
+        // No matches — clarification.
+        if (!lookupResult.lookup && lookupResult.candidates.length === 0) {
+          return res.json({
+            intent: 'lookup',
+            parsed: effectiveParsed,
+            lookup: null,
+            candidates: [],
+            answer: null,
+            needsClarification: {
+              fields: ['subjectName'],
+              prompt: lookupResult.message || `No partner matched "${effectiveParsed.subjectName}".`,
+            },
+          });
+        }
+
+        // Single match — generate the answer. If Haiku errors, return the
+        // structured lookup data anyway so the UI can render fallback.
+        let answer = null;
+        try {
+          const r = await generateLookupAnswer({
+            query, parsed: effectiveParsed, lookup: lookupResult.lookup,
+          });
+          if (r.usage) recordAiUsage(req, r.usage);
+          answer = r.answer;
+        } catch (err) {
+          console.error('[search] lookup answer generation failed:', err.message);
+        }
+
+        return res.json({
+          intent: 'lookup',
+          parsed: effectiveParsed,
+          lookup: lookupResult.lookup,
+          candidates: [],
+          answer,
+        });
+      }
+
+      // ── Search intent: standard inventory search ─────────────────────────
       // Bail with a clarification prompt when there's no narrowing signal —
       // i.e. no destination AND no qualitative must-haves. A bare type alone
       // ("any hotel") would dump the whole inventory, which is worse than
@@ -63,6 +124,7 @@ router.post(
         !(effectiveParsed.mustHave?.length);
       if (noNarrowingSignal) {
         return res.json({
+          intent: 'search',
           parsed: effectiveParsed,
           results: [],
           needsClarification: {
@@ -82,6 +144,7 @@ router.post(
       });
 
       return res.json({
+        intent: 'search',
         parsed: effectiveParsed,
         destination,           // resolved Destination doc summary, or null
         canonical,             // canonical destination name actually searched

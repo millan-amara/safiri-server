@@ -24,6 +24,11 @@ const RESULT_CAP = 10;
 const DEFAULT_NIGHTS_WHEN_ONLY_FROM = 3;
 const DEFAULT_CHILD_AGE = 8;
 const DEFAULT_ADULTS_WHEN_PRICING = 2;
+// Wider than this we treat the dateRange as a search window ("in July") rather
+// than a real stay. The pricer gets a 3-night sample inside the window and the
+// operator sees per-night pricing instead of a multi-week trip total they
+// didn't ask for. Budget filters then compare against per-night, not total.
+const MAX_STAY_SPAN_DAYS = 10;
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -95,7 +100,20 @@ function detectChildRateApplied(priced) {
 // Vector-search path for vibe queries. Returns null on any failure — caller
 // falls back to the regex path so an outage in Voyage / a missing Atlas index
 // degrades gracefully rather than breaking search outright.
-async function fetchHotelsByVector({ organizationId, query, canonical, mustHave }) {
+// Build the propertyType $or clause: type ∈ <list> OR name regex matching the
+// human-readable variant. The name match is forgiving for records that are
+// type-mislabeled — e.g. "AA Lodge Maasai Mara" tagged as `tented_camp` still
+// surfaces for a "lodge" query.
+function buildPropertyTypeClause(propertyType) {
+  if (!propertyType?.length) return null;
+  const clauses = [{ type: { $in: propertyType } }];
+  for (const t of propertyType) {
+    clauses.push({ name: flexibleTermRegex(t.replace(/_/g, ' ')) });
+  }
+  return { $or: clauses };
+}
+
+async function fetchHotelsByVector({ organizationId, query, canonical, mustHave, propertyType }) {
   // The full original query carries the most semantic signal; appending the
   // parser's mustHave terms hardens against the parser dropping qualifiers
   // (e.g. "luxury" buried in a longer prompt).
@@ -132,6 +150,10 @@ async function fetchHotelsByVector({ organizationId, query, canonical, mustHave 
     const re = flexibleTermRegex(canonical);
     pipeline.push({ $match: { $or: [{ destination: re }, { location: re }] } });
   }
+  // Atlas index doesn't carry `type` as a filter field, so apply property-type
+  // narrowing as a post-vectorSearch $match. Forgiving: type ∈ list OR name match.
+  const ptClause = buildPropertyTypeClause(propertyType);
+  if (ptClause) pipeline.push({ $match: ptClause });
   pipeline.push({ $limit: 50 });
 
   try {
@@ -150,31 +172,63 @@ async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, 
   let hotels = null;
   if (parsed.mustHave?.length && query) {
     hotels = await fetchHotelsByVector({
-      organizationId, query, canonical, mustHave: parsed.mustHave,
+      organizationId, query, canonical,
+      mustHave: parsed.mustHave,
+      propertyType: parsed.propertyType,
     });
   }
 
   if (!hotels || hotels.length === 0) {
     // Regex fallback. Also runs when the org hasn't been backfilled with
     // embeddings yet, or when Voyage / Atlas returned nothing usable.
+    //
+    // Multiple clauses (destination, propertyType, mustHave) are AND'd together
+    // via $and so independent $or conditions don't clobber each other.
     const filter = { organization: organizationId, isActive: true };
+    const conjuncts = [];
+
     if (canonical) {
       const re = flexibleTermRegex(canonical);
-      filter.$or = [{ destination: re }, { location: re }];
+      conjuncts.push({ $or: [{ destination: re }, { location: re }] });
     }
-    // mustHave terms — match against multiple text-bearing fields including type
-    // (so "tented camp" hits hotel.type='tented_camp') and amenities array.
+
+    const ptClause = buildPropertyTypeClause(parsed.propertyType);
+    if (ptClause) conjuncts.push(ptClause);
+
+    // mustHave terms — match against multiple text-bearing fields. Property-type
+    // words have already been promoted to parsed.propertyType by the parser so
+    // they don't double-filter here.
     const mustHaveFilter = buildMustHaveFilter(parsed.mustHave, [
-      'name', 'description', 'tags', 'type', 'amenities', 'location',
+      'name', 'description', 'tags', 'amenities', 'location',
     ]);
-    if (mustHaveFilter) Object.assign(filter, mustHaveFilter);
+    if (mustHaveFilter) conjuncts.push(mustHaveFilter);
+
+    if (conjuncts.length) filter.$and = conjuncts;
     hotels = await Hotel.find(filter).limit(50).lean();
   }
   if (!hotels.length) return [];
 
   const checkIn = isoToDate(parsed.dateRange?.from);
   const checkOutRaw = isoToDate(parsed.dateRange?.to);
-  const checkOut = checkIn ? (checkOutRaw || addDays(checkIn, DEFAULT_NIGHTS_WHEN_ONLY_FROM)) : null;
+
+  // Stay window vs search window:
+  //   "Jul 3 – Jul 7" (4 days)  → stay window: real check-in/out, total trip cost
+  //   "in July" (Jul 1 – Jul 31) → search window: price a 3-night sample, show per-night
+  //   "from Jul 3" (no `to`)    → stay window with default 3-night assumption
+  // The heuristic is purely span-based — no parser change needed.
+  let checkOut = null;
+  let isSearchWindow = false;
+  if (checkIn && checkOutRaw) {
+    const spanDays = Math.round((checkOutRaw - checkIn) / 86400000);
+    if (spanDays > MAX_STAY_SPAN_DAYS) {
+      checkOut = addDays(checkIn, DEFAULT_NIGHTS_WHEN_ONLY_FROM);
+      isSearchWindow = true;
+    } else {
+      checkOut = checkOutRaw;
+    }
+  } else if (checkIn) {
+    checkOut = addDays(checkIn, DEFAULT_NIGHTS_WHEN_ONLY_FROM);
+  }
   const haveDates = !!(checkIn && checkOut && checkOut > checkIn);
 
   // Pricing pax — fill assumed defaults but flag them so the UI shows a chip.
@@ -212,11 +266,19 @@ async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, 
         .reduce((s, f) => s + (f.amountInQuoteCurrency || 0), 0);
 
       const total = (priced.subtotalInQuoteCurrency || 0) + ptMandatoryTotal;
-      if (parsed.budgetMax && total > parsed.budgetMax) continue;
+      const perNight = priced.nights ? total / priced.nights : null;
+
+      // Budget comparison target depends on mode: per-night in a search window
+      // ("in July under $200" → operator means $200/night), trip total in a
+      // proper stay window ("Jul 3-7 under $1000" → operator means $1000 total).
+      if (parsed.budgetMax) {
+        const target = isSearchWindow ? perNight : total;
+        if (target != null && target > parsed.budgetMax) continue;
+      }
 
       const blockingCondition = (priced.conditions || []).some(c => c.severity === 'blocking');
 
-      results.push({
+      const sharedShape = {
         type: 'hotel',
         id: hotel._id,
         name: hotel.name,
@@ -231,34 +293,71 @@ async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, 
         roomType: priced.roomType || '',
         inclusions: priced.inclusions || [],
         exclusions: priced.exclusions || [],
-        computedPrice: {
-          pricingMode: 'total',
-          total,
-          currency: quoteCurrency,
-          perNight: priced.nights ? total / priced.nights : null,
-          nights: priced.nights,
-          sourceCurrency: priced.sourceCurrency,
-          fxRate: priced.fxRate,
-          breakdown: {
-            subtotal: priced.subtotalInQuoteCurrency || 0,
-            mandatoryFeesTotal: ptMandatoryTotal,
-            mandatoryAddOnsPerNightTotal: priced.mandatoryAddOnsPerNightTotal || 0,
-            mandatoryAddOnsPerNight: priced.mandatoryAddOnsPerNight || [],
-            optionalAddOns: (priced.addOns || []).filter(a => a.optional),
-            passThroughFees: priced.passThroughFees || [],
-          },
-        },
-        flags: {
-          noDatesGiven: false,
-          paxAssumed,
-          childAgeAssumed: childAgesAssumed && childAges.length > 0,
-          childRateApplied: detectChildRateApplied(priced),
-          blockingCondition,
-          imagesMissing: !hotel.images?.length,
-          extractionConfidence: priced.extractionConfidence || '',
-        },
         warnings: priced.warnings || [],
-      });
+      };
+      const sharedFlags = {
+        noDatesGiven: false,
+        paxAssumed,
+        childAgeAssumed: childAgesAssumed && childAges.length > 0,
+        childRateApplied: detectChildRateApplied(priced),
+        blockingCondition,
+        imagesMissing: !hotel.images?.length,
+        extractionConfidence: priced.extractionConfidence || '',
+      };
+
+      if (isSearchWindow) {
+        results.push({
+          ...sharedShape,
+          computedPrice: {
+            pricingMode: 'perNightInWindow',
+            perNight,
+            currency: quoteCurrency,
+            sourceCurrency: priced.sourceCurrency,
+            fxRate: priced.fxRate,
+            // Sample window we actually priced (3 nights at the start of the
+            // operator's search window) — the UI shows this so the operator
+            // knows what produced the per-night number.
+            sample: {
+              nights: priced.nights,
+              checkIn: checkIn.toISOString().slice(0, 10),
+              checkOut: checkOut.toISOString().slice(0, 10),
+            },
+            window: {
+              from: parsed.dateRange?.from || null,
+              to: parsed.dateRange?.to || null,
+            },
+            breakdown: {
+              mandatoryFeesTotal: ptMandatoryTotal,
+              mandatoryAddOnsPerNightTotal: priced.mandatoryAddOnsPerNightTotal || 0,
+              mandatoryAddOnsPerNight: priced.mandatoryAddOnsPerNight || [],
+              passThroughFees: priced.passThroughFees || [],
+            },
+          },
+          flags: { ...sharedFlags, searchWindowMode: true },
+        });
+      } else {
+        results.push({
+          ...sharedShape,
+          computedPrice: {
+            pricingMode: 'total',
+            total,
+            currency: quoteCurrency,
+            perNight,
+            nights: priced.nights,
+            sourceCurrency: priced.sourceCurrency,
+            fxRate: priced.fxRate,
+            breakdown: {
+              subtotal: priced.subtotalInQuoteCurrency || 0,
+              mandatoryFeesTotal: ptMandatoryTotal,
+              mandatoryAddOnsPerNightTotal: priced.mandatoryAddOnsPerNightTotal || 0,
+              mandatoryAddOnsPerNight: priced.mandatoryAddOnsPerNight || [],
+              optionalAddOns: (priced.addOns || []).filter(a => a.optional),
+              passThroughFees: priced.passThroughFees || [],
+            },
+          },
+          flags: { ...sharedFlags, searchWindowMode: false },
+        });
+      }
     } else {
       // No dates — use summarizeCheapestRate for a "from $X per person" signal.
       const summary = summarizeCheapestRate(hotel, { clientType, quoteCurrency, orgFxOverrides: {} });
@@ -306,10 +405,11 @@ async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, 
     }
   }
 
-  // Rank: cheapest first when we have totals; alphabetical when we have estimates.
+  // Rank: cheapest first across whichever number we have for each result —
+  // total (stay window), perNight (search window), perPerson (no dates).
   results.sort((a, b) => {
-    const av = a.computedPrice.total ?? a.computedPrice.perPerson ?? Infinity;
-    const bv = b.computedPrice.total ?? b.computedPrice.perPerson ?? Infinity;
+    const av = a.computedPrice.total ?? a.computedPrice.perNight ?? a.computedPrice.perPerson ?? Infinity;
+    const bv = b.computedPrice.total ?? b.computedPrice.perNight ?? b.computedPrice.perPerson ?? Infinity;
     return av - bv;
   });
 
@@ -540,6 +640,257 @@ async function searchPackages({ parsed, organizationId, canonical, quoteCurrency
 
   results.sort((a, b) => (a.computedPrice.total ?? Infinity) - (b.computedPrice.total ?? Infinity));
   return results.slice(0, RESULT_CAP);
+}
+
+// ─── LOOKUP (Q&A intent) ──────────────────────────────────────────────────────
+// Pulls the named partner + the topic-specific fields the rationale step needs
+// to answer "what's the cancellation policy for Serena?", "does X include park
+// fees?", etc. No pricing involved — we're asking ABOUT a partner, not pricing
+// them.
+
+async function findLookupCandidates({ subjectName, organizationId, type }) {
+  if (!subjectName) return [];
+
+  const re = flexibleTermRegex(subjectName);
+  const filter = { organization: organizationId, isActive: true, name: re };
+
+  if (type === 'hotel') {
+    return (await Hotel.find(filter).limit(5).lean()).map(h => ({ ...h, _kind: 'hotel' }));
+  }
+  if (type === 'activity') {
+    return (await Activity.find(filter).limit(5).lean()).map(a => ({ ...a, _kind: 'activity' }));
+  }
+  if (type === 'transport') {
+    return (await Transport.find(filter).limit(5).lean()).map(t => ({ ...t, _kind: 'transport' }));
+  }
+  if (type === 'package') {
+    return (await Package.find(filter).limit(5).lean()).map(p => ({ ...p, _kind: 'package' }));
+  }
+
+  // No type specified — fan out across all four. Hotels get priority since
+  // most "tell me about X" queries are hotel-focused.
+  const [hotels, packages, activities, transports] = await Promise.all([
+    Hotel.find(filter).limit(5).lean(),
+    Package.find(filter).limit(3).lean(),
+    Activity.find(filter).limit(3).lean(),
+    Transport.find(filter).limit(3).lean(),
+  ]);
+  return [
+    ...hotels.map(h => ({ ...h, _kind: 'hotel' })),
+    ...packages.map(p => ({ ...p, _kind: 'package' })),
+    ...activities.map(a => ({ ...a, _kind: 'activity' })),
+    ...transports.map(t => ({ ...t, _kind: 'transport' })),
+  ].slice(0, 5);
+}
+
+// Pick the most authoritative current rate list for topic extraction —
+// active, in-validity (preferred), highest priority. Falls back to any active
+// list if none are currently in window.
+function pickActiveRateList(hotel) {
+  const lists = (hotel.rateLists || []).filter(l => l.isActive !== false);
+  if (!lists.length) return null;
+  const now = Date.now();
+  const current = lists.filter(l => {
+    if (!l.validFrom && !l.validTo) return true;
+    if (l.validFrom && now < new Date(l.validFrom).getTime()) return false;
+    if (l.validTo && now > new Date(l.validTo).getTime()) return false;
+    return true;
+  });
+  return (current.length ? current : lists)
+    .slice().sort((a, b) => (b.priority || 0) - (a.priority || 0))[0];
+}
+
+// Strip the partner doc down to the fields relevant to the topic. Keeps the
+// LLM input small and prevents unrelated data (like full image URLs) from
+// inflating tokens or appearing in the answer.
+function buildLookupPayload(partner, topic) {
+  const base = {
+    kind: partner._kind,
+    id: partner._id,
+    name: partner.name,
+    destination: partner.destination || null,
+    location: partner.location || null,
+    image: pickHeroImage(partner.images),
+  };
+
+  if (partner._kind !== 'hotel') {
+    // Topic-specific extraction is hotel-focused for now. For non-hotels,
+    // return general info — the rationale layer can answer generally.
+    return {
+      ...base,
+      topic: 'general',
+      generalInfo: {
+        type: partner._kind,
+        description: partner.description || '',
+        amenities: partner.amenities || [],
+        meta: partner._kind === 'package'
+            ? { durationNights: partner.durationNights, durationDays: partner.durationDays, segments: partner.segments?.length || 0 }
+          : partner._kind === 'activity'
+            ? { duration: partner.duration, season: partner.season, pricingModel: partner.pricingModel }
+          : partner._kind === 'transport'
+            ? { type: partner.type, capacity: partner.capacity, pricingModel: partner.pricingModel }
+          : {},
+      },
+    };
+  }
+
+  const rateList = pickActiveRateList(partner);
+
+  if (topic === 'cancellation_policy') {
+    return {
+      ...base,
+      topic,
+      cancellation: rateList ? {
+        rateListName: rateList.name,
+        currency: rateList.currency,
+        depositPct: rateList.depositPct || 0,
+        tiers: rateList.cancellationTiers || [],
+        bookingTerms: rateList.bookingTerms || '',
+      } : null,
+    };
+  }
+  if (topic === 'inclusions') {
+    return {
+      ...base,
+      topic,
+      inclusions: rateList ? {
+        rateListName: rateList.name,
+        mealPlan: rateList.mealPlan,
+        mealPlanLabel: rateList.mealPlanLabel,
+        items: rateList.inclusions || [],
+      } : null,
+    };
+  }
+  if (topic === 'exclusions') {
+    return {
+      ...base,
+      topic,
+      exclusions: rateList ? {
+        rateListName: rateList.name,
+        items: rateList.exclusions || [],
+        mandatoryFees: (rateList.passThroughFees || []).filter(f => f.mandatory !== false).map(f => ({
+          name: f.name, unit: f.unit, currency: f.currency,
+        })),
+      } : null,
+    };
+  }
+  if (topic === 'fees') {
+    return {
+      ...base,
+      topic,
+      fees: rateList ? {
+        rateListName: rateList.name,
+        passThroughFees: rateList.passThroughFees || [],
+      } : null,
+    };
+  }
+  if (topic === 'rates') {
+    return {
+      ...base,
+      topic,
+      rates: {
+        currency: partner.currency,
+        rateListCount: (partner.rateLists || []).filter(l => l.isActive !== false).length,
+        cheapest: summarizeCheapestRate(partner, { quoteCurrency: partner.currency || 'USD', orgFxOverrides: {} }),
+        rateLists: (partner.rateLists || []).filter(l => l.isActive !== false).map(l => ({
+          name: l.name,
+          audience: l.audience,
+          currency: l.currency,
+          mealPlan: l.mealPlan,
+          validFrom: l.validFrom,
+          validTo: l.validTo,
+          priority: l.priority,
+        })),
+      },
+    };
+  }
+  if (topic === 'rooms') {
+    const roomTypes = new Set();
+    for (const list of (partner.rateLists || [])) {
+      if (list.isActive === false) continue;
+      for (const season of (list.seasons || [])) {
+        for (const r of (season.rooms || [])) {
+          if (r.roomType) roomTypes.add(r.roomType);
+        }
+      }
+    }
+    return { ...base, topic, rooms: [...roomTypes] };
+  }
+  if (topic === 'child_policy') {
+    // Aggregate child brackets across the active rate list. Operators usually
+    // mean "what's the rule" not "show me every season's variant" — but we
+    // pass them all and let the LLM summarize.
+    const brackets = [];
+    if (rateList) {
+      for (const season of (rateList.seasons || [])) {
+        for (const r of (season.rooms || [])) {
+          for (const b of (r.childBrackets || [])) {
+            brackets.push({ season: season.label, roomType: r.roomType, ...b });
+          }
+        }
+      }
+    }
+    return { ...base, topic, childPolicy: { rateListName: rateList?.name, brackets } };
+  }
+  if (topic === 'amenities') {
+    return { ...base, topic, amenities: partner.amenities || [] };
+  }
+  // 'general' or unrecognized topic
+  return {
+    ...base,
+    topic: 'general',
+    generalInfo: {
+      type: partner.type,
+      stars: partner.stars,
+      description: partner.description || '',
+      amenities: partner.amenities || [],
+      contactEmail: partner.contactEmail || null,
+      contactPhone: partner.contactPhone || null,
+      currency: partner.currency,
+      rateListCount: (partner.rateLists || []).filter(l => l.isActive !== false).length,
+    },
+  };
+}
+
+/**
+ * Resolve a Q&A query to a single partner + topic-specific data.
+ * Returns one of:
+ *   { lookup: <payload>, candidates: [] }            — exact match found
+ *   { lookup: null, candidates: [<slim>...] }        — multiple matches; ask operator to pick
+ *   { lookup: null, candidates: [], message: '...' } — no matches
+ */
+export async function executeLookup({ parsed, organizationId }) {
+  const candidates = await findLookupCandidates({
+    subjectName: parsed.subjectName,
+    organizationId,
+    type: parsed.type,
+  });
+
+  if (!candidates.length) {
+    return {
+      lookup: null,
+      candidates: [],
+      message: `No partner matched "${parsed.subjectName}".`,
+    };
+  }
+
+  if (candidates.length === 1) {
+    const topic = parsed.lookupTopic || 'general';
+    return { lookup: buildLookupPayload(candidates[0], topic), candidates: [] };
+  }
+
+  // Multiple — return slim candidate cards so the operator picks.
+  return {
+    lookup: null,
+    candidates: candidates.map(c => ({
+      kind: c._kind,
+      id: c._id,
+      name: c.name,
+      destination: c.destination || null,
+      location: c.location || null,
+      image: pickHeroImage(c.images),
+    })),
+  };
 }
 
 // ─── ENTRY POINT ──────────────────────────────────────────────────────────────

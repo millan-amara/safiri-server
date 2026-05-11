@@ -7,6 +7,11 @@ import Organization from '../models/Organization.js';
 import { protect, authorize } from '../middleware/auth.js';
 import { userCanSeePipeline, getAccessiblePipelineIds } from '../middleware/access.js';
 import { buildVoucherPdf, fmtVoucherNumber } from '../services/voucherPdf.js';
+import {
+  nextVoucherNumber,
+  previewVouchersFromQuote,
+  generateVouchersFromQuote,
+} from '../services/voucherGenerator.js';
 import { sendEmail, voucherEmail, operatorSenderName } from '../utils/email.js';
 
 const router = Router();
@@ -36,135 +41,6 @@ async function loadAccessibleVoucher(req, voucherId) {
   const { deal, error } = await loadAccessibleDeal(req, voucher.deal);
   if (error) return { error };
   return { voucher, deal };
-}
-
-// Per-org auto-incrementing voucher number. Same pattern as invoices.
-async function nextVoucherNumber(organizationId) {
-  const last = await Voucher.findOne({ organization: organizationId })
-    .sort({ voucherNumber: -1 })
-    .select('voucherNumber')
-    .lean();
-  return (last?.voucherNumber || 0) + 1;
-}
-
-// Derive a meal-plan code from the per-day meals booleans on a quote.day.
-// All three meals → FB; B+L or B+D → HB; just breakfast → BB; nothing → ''.
-// Multi-day stays inherit the FIRST day's plan — operator can edit per-voucher.
-function mealPlanFromMeals(meals) {
-  if (!meals) return '';
-  const { breakfast, lunch, dinner } = meals;
-  if (breakfast && lunch && dinner) return 'FB';
-  if (breakfast && (lunch || dinner)) return 'HB';
-  if (breakfast) return 'BB';
-  return '';
-}
-
-// Add `n` days to a Date without timezone drift (avoids DST half-day rounding).
-function addDays(date, n) {
-  const d = new Date(date);
-  d.setUTCDate(d.getUTCDate() + n);
-  d.setUTCHours(0, 0, 0, 0);
-  return d;
-}
-
-// Walk quote.days, group consecutive nights at the same hotel into stay
-// segments. A "different hotel" boundary or a day with no hotel ends a group.
-// Days without hotels (transit / arrival before first lodge) are skipped.
-//
-// Returns: [{ hotelSnapshot, roomType, mealPlan, firstDay, lastDay, nights }]
-// where firstDay/lastDay are dayNumber (1-indexed). checkIn/out are computed
-// later from the quote's startDate.
-function groupConsecutiveStays(days) {
-  const groups = [];
-  let current = null;
-
-  // Sort defensively — days SHOULD already be in dayNumber order, but defend
-  // against quotes whose days array got reordered in the UI without resorting.
-  const sorted = [...(days || [])].sort((a, b) => (a.dayNumber || 0) - (b.dayNumber || 0));
-
-  for (const day of sorted) {
-    const hotel = day.hotel;
-    if (!hotel?.name) {
-      // No accommodation this night — close any open group.
-      if (current) { groups.push(current); current = null; }
-      continue;
-    }
-
-    // Same hotel as previous? Extend the current group. Match by hotelId
-    // first (more reliable than name when an org has two lodges with the
-    // same display name), fall back to name.
-    const sameAsPrev = current
-      && (
-        (current.hotelId && (hotel.hotelId || hotel._id) && String(current.hotelId) === String(hotel.hotelId || hotel._id))
-        || (!current.hotelId && current.name === hotel.name)
-      );
-
-    if (sameAsPrev) {
-      current.lastDay = day.dayNumber;
-    } else {
-      if (current) groups.push(current);
-      current = {
-        hotelId: hotel.hotelId || hotel._id || null,
-        name: hotel.name,
-        location: [hotel.location, hotel.destination].filter(Boolean).join(', '),
-        contactEmail: hotel.contactEmail || '',
-        contactPhone: hotel.contactPhone || '',
-        roomType: day.roomType || '',
-        mealPlan: mealPlanFromMeals(day.meals),
-        firstDay: day.dayNumber,
-        lastDay: day.dayNumber,
-      };
-    }
-  }
-  if (current) groups.push(current);
-
-  // nights = (lastDay - firstDay) + 1. checkOut is the morning AFTER lastDay.
-  return groups.map(g => ({ ...g, nights: (g.lastDay - g.firstDay) + 1 }));
-}
-
-// Preview what generate-from-quote WOULD create. Used by the modal to show
-// the operator a list of stays before they commit. Also computes which
-// segments would be skipped because a non-cancelled voucher already exists.
-async function previewVouchersFromQuote(quote, existingVouchers) {
-  if (!quote.startDate) {
-    return { error: 'Quote has no start date — set travel dates before generating vouchers.' };
-  }
-
-  const groups = groupConsecutiveStays(quote.days);
-  if (groups.length === 0) {
-    return { error: 'No hotels found in this quote.' };
-  }
-
-  // Dedup key: hotelName + checkInISO. Same hotel on different dates is a
-  // separate stay (split visit), so dates matter.
-  const existingKeys = new Set(
-    (existingVouchers || [])
-      .filter(v => v.status !== 'cancelled')
-      .map(v => `${v.hotel?.name || ''}|${v.checkIn ? new Date(v.checkIn).toISOString().slice(0, 10) : ''}`)
-  );
-
-  const segments = groups.map(g => {
-    const checkIn = addDays(quote.startDate, g.firstDay - 1);
-    const checkOut = addDays(quote.startDate, g.lastDay);
-    const key = `${g.name}|${checkIn.toISOString().slice(0, 10)}`;
-    return {
-      hotelId: g.hotelId,
-      hotel: {
-        name: g.name,
-        location: g.location,
-        contactEmail: g.contactEmail,
-        contactPhone: g.contactPhone,
-      },
-      roomType: g.roomType,
-      mealPlan: g.mealPlan,
-      checkIn,
-      checkOut,
-      nights: g.nights,
-      alreadyExists: existingKeys.has(key),
-    };
-  });
-
-  return { segments };
 }
 
 // LIST — per-deal panel (?deal=) or org-wide
@@ -419,7 +295,8 @@ router.get('/preview-from-quote/:quoteId', protect, async (req, res) => {
 
 // GENERATE — create draft vouchers for every accommodation segment in the
 // quote. Skips segments that already have a non-cancelled voucher (so re-running
-// after adding a stop is safe).
+// after adding a stop is safe). Delegates the create loop to the shared
+// generator service so the auto-on-Won path uses the exact same logic.
 router.post('/generate-from-quote', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
     const { quoteId } = req.body;
@@ -437,73 +314,29 @@ router.post('/generate-from-quote', protect, authorize('owner', 'admin', 'agent'
     const { deal, error: accessError } = await loadAccessibleDeal(req, quote.deal);
     if (accessError) return res.status(accessError.status).json({ message: accessError.message });
 
-    const existing = await Voucher.find({
-      organization: req.organizationId,
-      deal: quote.deal,
-    }).select('hotel checkIn status').lean();
-
-    const { segments, error } = await previewVouchersFromQuote(quote, existing);
-    if (error) return res.status(400).json({ message: error });
-
-    // Snapshot the lead guest from the deal's contact (same defaulting logic
-    // as the manual create route).
-    const guest = {
-      name: deal.contact ? `${deal.contact.firstName || ''} ${deal.contact.lastName || ''}`.trim() : '',
-      email: deal.contact?.email || '',
-      phone: deal.contact?.phone || '',
-    };
-    const adults = quote.travelers?.adults || deal.groupSize || 1;
-    const children = quote.travelers?.children || 0;
-
-    const created = [];
-    const failed = [];
-    let skipped = 0;
-    for (const seg of segments) {
-      if (seg.alreadyExists) { skipped++; continue; }
-      try {
-        const voucher = await Voucher.create({
-          organization: req.organizationId,
-          deal: deal._id,
-          contact: deal.contact?._id || null,
-          quote: quote._id,
-          createdBy: req.user._id,
-          voucherNumber: await nextVoucherNumber(req.organizationId),
-          hotelRef: seg.hotelId || null,
-          hotel: seg.hotel,
-          guest,
-          adults,
-          children,
-          checkIn: seg.checkIn,
-          checkOut: seg.checkOut,
-          roomType: seg.roomType,
-          rooms: 1,
-          mealPlan: seg.mealPlan,
-        });
-        created.push(voucher);
-      } catch (err) {
-        // Most likely cause is the unique-index race on voucherNumber, which
-        // is recoverable on a manual retry. Continue the batch so partial
-        // success still ships, but surface the failures in the response.
-        console.error('Voucher generate failed one segment:', err.message);
-        failed.push({ hotel: seg.hotel?.name || 'unknown', message: err.message });
-      }
-    }
+    const result = await generateVouchersFromQuote({
+      quote,
+      deal,
+      organizationId: req.organizationId,
+      userId: req.user._id,
+    });
+    if (result.error) return res.status(400).json({ message: result.error });
 
     // If every attempt failed, this isn't a partial success — return 500 with
     // the first error so the operator knows something is actually broken.
-    const attempts = segments.length - skipped;
-    if (attempts > 0 && created.length === 0) {
+    const attempts = (result.total || 0) - (result.skipped || 0);
+    if (attempts > 0 && result.created.length === 0) {
       return res.status(500).json({
-        message: failed[0]?.message || 'Failed to generate vouchers',
-        failed,
+        message: result.failed[0]?.message || 'Failed to generate vouchers',
+        failed: result.failed,
       });
     }
 
     res.status(201).json({
-      created,
-      skipped,
-      failed,
-      total: segments.length,
+      created: result.created,
+      skipped: result.skipped,
+      failed: result.failed,
+      total: result.total,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -523,6 +356,17 @@ router.post('/:id/email', protect, authorize('owner', 'admin', 'agent'), async (
       : String(req.body.to || '').split(',').map(s => s.trim()).filter(Boolean);
     if (recipients.length === 0) {
       return res.status(400).json({ message: 'At least one recipient is required.' });
+    }
+
+    // Guard against sending vouchers without the lodge's PRN. The auto-on-Won
+    // flow creates drafts with no confirmationNumber on purpose — sending one
+    // out before the operator pastes the PRN gives the lodge a useless doc.
+    // The frontend can pass force: true to override after explicit confirmation.
+    if (!String(voucher.confirmationNumber || '').trim() && req.body.force !== true) {
+      return res.status(400).json({
+        message: 'Voucher has no confirmation number (PRN). Add the lodge confirmation before sending, or pass force: true to override.',
+        code: 'PRN_MISSING',
+      });
     }
 
     const org = await Organization.findById(req.organizationId).lean();

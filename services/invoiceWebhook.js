@@ -15,6 +15,13 @@ const RETAIN_FAILED_DAYS = 180;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 function buildPayload(event, invoice, org) {
+  // Compute payment-derived totals here so lean docs (no virtuals) and
+  // hydrated documents both produce the same payload.
+  const total = Number(invoice.total) || 0;
+  const paymentsArr = Array.isArray(invoice.payments) ? invoice.payments : [];
+  const amountPaid = Math.round(paymentsArr.reduce((s, p) => s + (Number(p.amount) || 0), 0) * 100) / 100;
+  const amountDue = Math.max(0, Math.round((total - amountPaid) * 100) / 100);
+
   return {
     event,
     timestamp: new Date().toISOString(),
@@ -33,10 +40,21 @@ function buildPayload(event, invoice, org) {
       subtotal: invoice.subtotal,
       taxPercent: invoice.taxPercent,
       taxAmount: invoice.taxAmount,
-      total: invoice.total,
+      total,
+      amountPaid,
+      amountDue,
       currency: invoice.currency,
       paymentInstructions: invoice.paymentInstructions,
       notes: invoice.notes,
+      payments: paymentsArr.map(p => ({
+        amount: p.amount,
+        currency: p.currency,
+        method: p.method,
+        reference: p.reference,
+        paidAt: p.paidAt,
+        source: p.source,
+        processorRef: p.processorRef,
+      })),
     },
   };
 }

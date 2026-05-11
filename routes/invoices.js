@@ -151,13 +151,19 @@ router.post('/split', protect, authorize('owner', 'admin', 'agent'), async (req,
     deposit.invoiceNumber = await nextInvoiceNumber(req.organizationId);
     deposit.createdBy = req.user._id;
     const depositInv = await Invoice.create(deposit);
-    fireInvoiceWebhook('invoice.created', depositInv);
 
     // Take a fresh number AFTER the deposit insert so the second one wins on
     // a concurrent insert race instead of colliding on the unique index.
     balance.invoiceNumber = await nextInvoiceNumber(req.organizationId);
     balance.createdBy = req.user._id;
+    balance.relatedInvoice = depositInv._id;
     const balanceInv = await Invoice.create(balance);
+
+    // Backfill the deposit → balance link now that we have the balance id.
+    depositInv.relatedInvoice = balanceInv._id;
+    await depositInv.save();
+
+    fireInvoiceWebhook('invoice.created', depositInv);
     fireInvoiceWebhook('invoice.created', balanceInv);
 
     res.status(201).json({ deposit: depositInv, balance: balanceInv });
@@ -212,18 +218,174 @@ router.post('/:id/mark-sent', protect, authorize('owner', 'admin', 'agent'), asy
   }
 });
 
-// MARK PAID
+const PAYMENT_METHODS = ['cash', 'bank_transfer', 'mpesa', 'card', 'other'];
+
+const PAYMENT_METHOD_LABEL = {
+  cash:          'cash',
+  bank_transfer: 'bank transfer',
+  mpesa:         'M-Pesa',
+  card:          'card',
+  other:         'other',
+};
+
+// Format an amount with currency. Used in deal activity descriptions so the
+// timeline reads naturally without requiring a UI lookup.
+function fmtAmount(amount, currency) {
+  return `${currency || 'USD'} ${Number(amount || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// MARK PAID — shorthand for "client paid the remaining balance, however".
+// Funnels through payments[] so the audit trail captures who/when/method
+// instead of just a status flip. Optional body fields override the defaults.
 router.post('/:id/mark-paid', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
   try {
-    const { invoice, error } = await loadAccessibleInvoice(req, req.params.id);
+    const { invoice, deal, error } = await loadAccessibleInvoice(req, req.params.id);
     if (error) return res.status(error.status).json({ message: error.message });
     if (invoice.status === 'cancelled') {
       return res.status(400).json({ message: 'Cancelled invoices cannot be marked paid — uncancel first.' });
     }
-    invoice.status = 'paid';
-    invoice.paidAt = new Date();
+    if (invoice.status === 'paid') {
+      return res.json(invoice);
+    }
+
+    const remaining = Math.max(0, Math.round(((Number(invoice.total) || 0) - invoice.amountPaid) * 100) / 100);
+    if (remaining > 0) {
+      invoice.payments.push({
+        amount: remaining,
+        currency: invoice.currency,
+        method: PAYMENT_METHODS.includes(req.body?.method) ? req.body.method : 'other',
+        reference: req.body?.reference || '',
+        paidAt: req.body?.paidAt ? new Date(req.body.paidAt) : new Date(),
+        notes: req.body?.notes || 'Marked paid by operator',
+        recordedBy: req.user._id,
+        source: 'manual',
+      });
+    }
+
+    const { becamePaid } = invoice.applyPaymentsRecompute();
     await invoice.save();
-    fireInvoiceWebhook('invoice.paid', invoice);
+    if (becamePaid) fireInvoiceWebhook('invoice.paid', invoice);
+
+    if (remaining > 0) {
+      deal.activities.push({
+        type: 'payment_recorded',
+        description: `${req.user.name || 'Operator'} marked ${fmtInvoiceNumber(invoice.invoiceNumber)} paid (${fmtAmount(remaining, invoice.currency)})`,
+        createdBy: req.user._id,
+        createdAt: new Date(),
+        metadata: { invoiceId: invoice._id, amount: remaining, source: 'mark_paid' },
+      });
+      await deal.save();
+    }
+
+    res.json(invoice);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// LOG PAYMENT — append one payment row. Status auto-recomputes:
+//   sum < total  → partially_paid
+//   sum >= total → paid (fires invoice.paid webhook on the actual transition)
+// Cancelled invoices reject; over-payment rejects (no implicit refunds).
+router.post('/:id/payments', protect, authorize('owner', 'admin', 'agent'), async (req, res) => {
+  try {
+    const { invoice, deal, error } = await loadAccessibleInvoice(req, req.params.id);
+    if (error) return res.status(error.status).json({ message: error.message });
+    if (invoice.status === 'cancelled') {
+      return res.status(400).json({ message: 'Cancelled invoices cannot accept payments.' });
+    }
+
+    const { amount, method, reference, paidAt, notes } = req.body || {};
+    const amt = Math.round(Number(amount) * 100) / 100;
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ message: 'amount must be a positive number.' });
+    }
+
+    const due = Math.max(0, Math.round(((Number(invoice.total) || 0) - invoice.amountPaid) * 100) / 100);
+    if (due === 0) {
+      return res.status(400).json({ message: 'Invoice is already fully paid.' });
+    }
+    // Allow a 1-cent tolerance so floating-point rounding doesn't reject a
+    // payment that exactly matches the displayed balance.
+    if (amt > due + 0.01) {
+      return res.status(400).json({ message: `Amount exceeds outstanding balance of ${due.toFixed(2)} ${invoice.currency}.` });
+    }
+
+    const chosenMethod = PAYMENT_METHODS.includes(method) ? method : 'other';
+    invoice.payments.push({
+      amount: amt,
+      currency: invoice.currency,
+      method: chosenMethod,
+      reference: reference || '',
+      paidAt: paidAt ? new Date(paidAt) : new Date(),
+      notes: notes || '',
+      recordedBy: req.user._id,
+      source: 'manual',
+    });
+
+    const { becamePaid } = invoice.applyPaymentsRecompute();
+    await invoice.save();
+    if (becamePaid) fireInvoiceWebhook('invoice.paid', invoice);
+
+    const refSuffix = reference ? `, ref ${reference}` : '';
+    deal.activities.push({
+      type: 'payment_recorded',
+      description: `${req.user.name || 'Operator'} recorded ${fmtAmount(amt, invoice.currency)} payment on ${fmtInvoiceNumber(invoice.invoiceNumber)} via ${PAYMENT_METHOD_LABEL[chosenMethod]}${refSuffix}`,
+      createdBy: req.user._id,
+      createdAt: new Date(),
+      metadata: {
+        invoiceId: invoice._id,
+        amount: amt,
+        method: chosenMethod,
+        reference: reference || '',
+        becamePaid,
+      },
+    });
+    await deal.save();
+
+    res.status(201).json(invoice);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// REMOVE PAYMENT — owner/admin only since it corrects bookkeeping. Status
+// auto-recomputes (paid → partially_paid → sent as the array empties out).
+// Doesn't fire a webhook on the demotion — consumers should reconcile from
+// the next invoice.paid event or fetch state directly if they need to track
+// reversals.
+router.delete('/:id/payments/:paymentId', protect, authorize('owner', 'admin'), async (req, res) => {
+  try {
+    const { invoice, deal, error } = await loadAccessibleInvoice(req, req.params.id);
+    if (error) return res.status(error.status).json({ message: error.message });
+
+    const payment = invoice.payments.id(req.params.paymentId);
+    if (!payment) return res.status(404).json({ message: 'Payment not found' });
+
+    // Snapshot before pull so we can describe what was removed in the activity log.
+    const removedAmount = payment.amount;
+    const removedMethod = payment.method;
+    const removedRef = payment.reference;
+
+    invoice.payments.pull({ _id: req.params.paymentId });
+    invoice.applyPaymentsRecompute();
+    await invoice.save();
+
+    const refSuffix = removedRef ? `, ref ${removedRef}` : '';
+    deal.activities.push({
+      type: 'payment_removed',
+      description: `${req.user.name || 'Operator'} removed ${fmtAmount(removedAmount, invoice.currency)} payment from ${fmtInvoiceNumber(invoice.invoiceNumber)} (${PAYMENT_METHOD_LABEL[removedMethod] || removedMethod}${refSuffix})`,
+      createdBy: req.user._id,
+      createdAt: new Date(),
+      metadata: {
+        invoiceId: invoice._id,
+        amount: removedAmount,
+        method: removedMethod,
+        reference: removedRef || '',
+      },
+    });
+    await deal.save();
+
     res.json(invoice);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -307,29 +469,52 @@ router.get('/export.csv', protect, async (req, res) => {
       'Invoice Number', 'Status', 'Issued', 'Due', 'Sent', 'Paid',
       'Client Name', 'Client Company', 'Client Email', 'Client Phone',
       'Deal', 'Currency', 'Subtotal', 'Tax %', 'Tax Amount', 'Total',
+      'Amount Paid', 'Amount Due', 'Payments',
       'Notes',
     ];
 
     const isoDate = (d) => d ? new Date(d).toISOString().slice(0, 10) : '';
-    const rows = filtered.map(inv => [
-      fmtInvoiceNumber(inv.invoiceNumber),
-      inv.status,
-      isoDate(inv.issueDate),
-      isoDate(inv.dueDate),
-      isoDate(inv.sentAt),
-      isoDate(inv.paidAt),
-      inv.client?.name || '',
-      inv.client?.company || '',
-      inv.client?.email || '',
-      inv.client?.phone || '',
-      inv.deal?.title || '',
-      inv.currency || '',
-      Number(inv.subtotal || 0).toFixed(2),
-      Number(inv.taxPercent || 0).toFixed(2),
-      Number(inv.taxAmount || 0).toFixed(2),
-      Number(inv.total || 0).toFixed(2),
-      inv.notes || '',
-    ]);
+    const rows = filtered.map(inv => {
+      // Compute amountPaid/amountDue manually since lean() docs don't include
+      // virtuals. Also flatten payments into a semicolon-joined column for
+      // bank reconciliation — accountants want refs visible at-a-glance
+      // without opening the deal.
+      const payments = inv.payments || [];
+      const amountPaid = payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+      const amountDue = Math.max(0, (Number(inv.total) || 0) - amountPaid);
+      const paymentsCol = payments
+        .map(p => {
+          const date = isoDate(p.paidAt);
+          const amt = Number(p.amount || 0).toFixed(2);
+          const method = p.method || '';
+          const ref = p.reference || '';
+          return [date, method, amt, ref].filter(Boolean).join(' ');
+        })
+        .join('; ');
+
+      return [
+        fmtInvoiceNumber(inv.invoiceNumber),
+        inv.status,
+        isoDate(inv.issueDate),
+        isoDate(inv.dueDate),
+        isoDate(inv.sentAt),
+        isoDate(inv.paidAt),
+        inv.client?.name || '',
+        inv.client?.company || '',
+        inv.client?.email || '',
+        inv.client?.phone || '',
+        inv.deal?.title || '',
+        inv.currency || '',
+        Number(inv.subtotal || 0).toFixed(2),
+        Number(inv.taxPercent || 0).toFixed(2),
+        Number(inv.taxAmount || 0).toFixed(2),
+        Number(inv.total || 0).toFixed(2),
+        amountPaid.toFixed(2),
+        amountDue.toFixed(2),
+        paymentsCol,
+        inv.notes || '',
+      ];
+    });
 
     // Cells starting with =, +, -, @, tab, or CR are interpreted as formulas
     // by Excel/Sheets when the CSV is opened. A deal title like
@@ -387,9 +572,17 @@ router.post('/:id/email', protect, authorize('owner', 'admin', 'agent'), async (
       orgName: org?.name,
       message: req.body.message || '',
       type: invoice.type || 'full',
+      // Virtuals on the hydrated doc — let the template re-frame the email
+      // as "balance reminder" or "receipt" when payments have been recorded.
+      amountPaid: invoice.amountPaid,
+      amountDue: invoice.amountDue,
     });
 
-    const subjectPrefix = invoice.type === 'deposit' ? 'Deposit invoice'
+    // Subject auto-reframes for partial / paid-in-full sends so the inbox
+    // preview reflects what's actually in the email.
+    const subjectPrefix = invoice.status === 'paid' ? 'Receipt'
+      : invoice.amountPaid > 0 ? 'Balance reminder'
+      : invoice.type === 'deposit' ? 'Deposit invoice'
       : invoice.type === 'balance' ? 'Balance invoice'
       : 'Invoice';
 

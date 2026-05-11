@@ -2,9 +2,14 @@
 // result, using the server-computed numbers as facts (the LLM is NOT asked to
 // price anything — pricing already happened in searchExecutor). Output is
 // trust-bounded to the input data, so a hallucinated price can't reach the UI.
+//
+// Also hosts generateLookupAnswer — the Q&A path's answer composer, which
+// takes the partner+topic data the executor pulled and turns it into a 1–3
+// sentence operator answer.
 
 const RATIONALE_MODEL = 'claude-haiku-4-5';
 const MAX_RESULTS_FOR_RATIONALE = 3;
+const LOOKUP_MODEL = 'claude-haiku-4-5';
 
 const SYSTEM_PROMPT = `You write one-line rationales for travel partner search results.
 
@@ -188,4 +193,78 @@ export async function generateRationales({ query, parsed, results }) {
     : [];
 
   return { rationales, usage };
+}
+
+// ─── LOOKUP ANSWER (Q&A intent) ───────────────────────────────────────────────
+
+const LOOKUP_SYSTEM_PROMPT = `You answer one travel-operator question about ONE specific partner using ONLY the data provided.
+
+Rules:
+- 1–3 sentences. Plain prose. No markdown, no headings, no emojis.
+- Cite specific data: amounts, currencies, day counts, percentages, named tiers/seasons. Round currency amounts to whole numbers.
+- If a topic is requested but the data is missing or empty (e.g. cancellation tiers array is empty), say so plainly: "No cancellation policy is recorded for this hotel — the rate list doesn't define one." Don't fabricate one.
+- Don't repeat the partner name (the UI already shows it).
+- Don't add generic recommendations or sales language ("a great option", "perfect for").
+- For cancellation_policy: list the tier breakpoints in order (e.g. "30+ days: 25%, 14–29 days: 50%, <14 days: 100%"). Mention the deposit requirement once if non-zero.
+- For inclusions/exclusions: list the items as a comma-separated phrase, naming the meal plan once.
+- For fees: name each pass-through fee with its unit ("Mara Reserve Fee — per person per day, USD 100 nonResident").
+- For child_policy: summarize the dominant pattern across brackets — don't dump every season.
+- For rates/general: keep to the most useful 1–2 facts.
+
+Return ONLY this JSON: { "answer": "<one to three sentences>" }`;
+
+/**
+ * Generate a one-paragraph answer to a Q&A query using the lookup payload the
+ * executor produced. Returns { answer, usage }. Throws on API errors so the
+ * route can fall back to a structured-only response.
+ */
+export async function generateLookupAnswer({ query, parsed, lookup }) {
+  if (!lookup) return { answer: null, usage: null };
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured');
+
+  const userMessage =
+    `Operator question: "${(query || '').slice(0, 300)}"\n\n` +
+    `Topic: ${lookup.topic}\n` +
+    `Partner kind: ${lookup.kind}\n` +
+    `Partner name: ${lookup.name}\n` +
+    `Destination: ${lookup.destination || '—'}\n\n` +
+    `Topic data:\n${JSON.stringify(lookup, null, 2)}\n\n` +
+    `Write the answer.`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: LOOKUP_MODEL,
+      max_tokens: 350,
+      system: [{ type: 'text', text: LOOKUP_SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: userMessage }],
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Claude API error: ${err}`);
+  }
+
+  const data = await response.json();
+  const text = data.content?.[0]?.text || '';
+  const u = data.usage || {};
+  const usage = {
+    model: LOOKUP_MODEL,
+    inputTokens: u.input_tokens || 0,
+    outputTokens: u.output_tokens || 0,
+    cacheReadInputTokens: u.cache_read_input_tokens || 0,
+    cacheCreationInputTokens: u.cache_creation_input_tokens || 0,
+  };
+
+  const raw = extractJson(text);
+  const answer = (raw && typeof raw.answer === 'string') ? raw.answer.trim().slice(0, 600) : null;
+  return { answer, usage };
 }

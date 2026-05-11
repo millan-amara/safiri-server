@@ -1,5 +1,27 @@
 import mongoose from 'mongoose';
 
+// One row per recorded payment against the invoice. Manual operator entries
+// land here via POST /api/invoices/:id/payments. Stage 2 (hosted Paystack
+// links) will append rows with source='paystack' from the payment callback,
+// using processorRef as the dedup key.
+const paymentSchema = new mongoose.Schema({
+  amount: { type: Number, required: true, min: 0.01 },
+  currency: { type: String, default: 'USD' },
+  method: {
+    type: String,
+    enum: ['cash', 'bank_transfer', 'mpesa', 'card', 'other'],
+    default: 'other',
+  },
+  reference: { type: String, default: '' },
+  paidAt: { type: Date, default: Date.now },
+  recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  notes: { type: String, default: '' },
+  source: { type: String, enum: ['manual', 'paystack'], default: 'manual' },
+  // Processor-side reference (e.g. Paystack txn ref). Used as a dedup key
+  // when a callback and a webhook both try to record the same charge.
+  processorRef: { type: String, default: '' },
+}, { timestamps: true });
+
 // Per-deal invoice. Generated either manually from the deal-detail panel or
 // auto-drafted when a deal moves to a Won-typed stage (org preference).
 const invoiceSchema = new mongoose.Schema({
@@ -23,6 +45,11 @@ const invoiceSchema = new mongoose.Schema({
     enum: ['full', 'deposit', 'balance'],
     default: 'full',
   },
+
+  // Sibling invoice in a deposit/balance pair. Cross-set on both rows by
+  // /split so the UI can render the pair as one billing schedule and the
+  // accountant integration can group them.
+  relatedInvoice: { type: mongoose.Schema.Types.ObjectId, ref: 'Invoice' },
 
   // Snapshotted at creation so renaming/editing the contact later doesn't
   // mutate historical invoices. If the contact is gone, the invoice still has
@@ -56,9 +83,14 @@ const invoiceSchema = new mongoose.Schema({
   paymentInstructions: { type: String, default: '' },
   notes: { type: String, default: '' },
 
+  // Recorded payments. Status is auto-derived from this array via
+  // applyPaymentsRecompute(); never set status manually after a payment
+  // change or the audit trail will diverge from the totals.
+  payments: [paymentSchema],
+
   status: {
     type: String,
-    enum: ['draft', 'sent', 'paid', 'cancelled'],
+    enum: ['draft', 'sent', 'partially_paid', 'paid', 'cancelled'],
     default: 'draft',
   },
   sentAt: Date,
@@ -69,5 +101,51 @@ invoiceSchema.index({ organization: 1, invoiceNumber: 1 }, { unique: true });
 invoiceSchema.index({ deal: 1 });
 invoiceSchema.index({ organization: 1, status: 1 });
 invoiceSchema.index({ organization: 1, createdAt: -1 });
+
+invoiceSchema.virtual('amountPaid').get(function () {
+  return Math.round(((this.payments || []).reduce((s, p) => s + (Number(p.amount) || 0), 0)) * 100) / 100;
+});
+
+invoiceSchema.virtual('amountDue').get(function () {
+  return Math.max(0, Math.round(((Number(this.total) || 0) - this.amountPaid) * 100) / 100);
+});
+
+invoiceSchema.set('toJSON', { virtuals: true });
+invoiceSchema.set('toObject', { virtuals: true });
+
+// Recompute status from payments[]. Idempotent. Cancelled invoices are left
+// alone (explicit operator state). Returns { becamePaid } so the caller can
+// decide whether to fire invoice.paid — only on the actual transition, never
+// on a re-save of an already-paid invoice.
+invoiceSchema.methods.applyPaymentsRecompute = function () {
+  if (this.status === 'cancelled') {
+    return { becamePaid: false };
+  }
+
+  const wasPaid = this.status === 'paid';
+  const total = Number(this.total) || 0;
+  const paid = this.amountPaid;
+
+  if (total > 0 && paid >= total) {
+    this.status = 'paid';
+    // Use the latest payment's paidAt so backdated entries stamp correctly.
+    const latest = (this.payments || []).reduce((acc, p) => {
+      const t = p.paidAt ? new Date(p.paidAt).getTime() : 0;
+      return t > acc ? t : acc;
+    }, 0);
+    this.paidAt = latest ? new Date(latest) : new Date();
+    if (!this.sentAt) this.sentAt = new Date();
+  } else if (paid > 0) {
+    this.status = 'partially_paid';
+    this.paidAt = null;
+    if (!this.sentAt) this.sentAt = new Date();
+  } else {
+    // No payments left — fall back to sent if it ever went out, else draft.
+    this.status = this.sentAt ? 'sent' : 'draft';
+    this.paidAt = null;
+  }
+
+  return { becamePaid: !wasPaid && this.status === 'paid' };
+};
 
 export default mongoose.model('Invoice', invoiceSchema);
