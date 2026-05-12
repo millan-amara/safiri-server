@@ -83,14 +83,18 @@ export const authorize = (...roles) => {
   };
 };
 
+// Parsed SUPERADMIN_EMAILS env list. Centralised so both the gate check and
+// the operator-notify path (signup alerts) share a single parser — keeps the
+// list of "who is operator" in one place.
+export const superAdminEmails = () => (process.env.SUPERADMIN_EMAILS || '')
+  .split(',')
+  .map(e => e.trim().toLowerCase())
+  .filter(Boolean);
+
 // Superadmin check — email whitelist from env (comma-separated SUPERADMIN_EMAILS).
 export const isSuperAdminEmail = (email) => {
   if (!email) return false;
-  const list = (process.env.SUPERADMIN_EMAILS || '')
-    .split(',')
-    .map(e => e.trim().toLowerCase())
-    .filter(Boolean);
-  return list.includes(email.toLowerCase());
+  return superAdminEmails().includes(email.toLowerCase());
 };
 
 // Apply AFTER `protect` so req.user is populated.

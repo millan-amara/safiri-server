@@ -4,8 +4,8 @@ import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
 import Organization from '../models/Organization.js';
 import { Pipeline } from '../models/Deal.js';
-import { protect, generateToken, isSuperAdminEmail } from '../middleware/auth.js';
-import { sendEmail, resetPasswordEmail, welcomeEmail, verifyEmailTemplate } from '../utils/email.js';
+import { protect, generateToken, isSuperAdminEmail, superAdminEmails } from '../middleware/auth.js';
+import { sendEmail, resetPasswordEmail, welcomeEmail, verifyEmailTemplate, signupNotificationEmail } from '../utils/email.js';
 import slugify from 'slugify';
 import { PLANS, nextMonthlyResetDate } from '../config/plans.js';
 
@@ -48,6 +48,35 @@ async function seedStarterPipelines(organizationId) {
 // passphrases painful; for higher security pair with rate limiting (already
 // in place at /api/auth/* via app.js).
 const MIN_PASSWORD_LENGTH = 10;
+
+// Fire-and-forget: alert every address in SUPERADMIN_EMAILS that a new org
+// has signed up. Both the local-register and Google-OAuth signup paths call
+// this. Failures are logged but never block the signup response — the user
+// has already been told their account is ready.
+function notifyNewSignup({ org, user, signupSource }) {
+  const recipients = superAdminEmails();
+  if (recipients.length === 0) {
+    return; // No-op when env isn't configured — keeps dev/test runs quiet.
+  }
+  const html = signupNotificationEmail({
+    orgName: org.name,
+    userName: user.name || user.email,
+    userEmail: user.email,
+    userPhone: user.phone || '',
+    signupSource,
+    isoTimestamp: new Date().toISOString(),
+  });
+  // sendEmail can accept a string or array `to`; passing the array sends one
+  // message that hits every operator. If you'd rather have one-per-recipient
+  // (e.g. for per-address deliverability tracking), swap to a Promise.all map.
+  sendEmail({
+    to: recipients,
+    subject: `[Signup] ${org.name}`,
+    html,
+  }).catch((err) => {
+    console.error(`[auth] signup-notify failed for ${org.slug || org._id}:`, err.message);
+  });
+}
 
 // Register new org + owner
 router.post('/register', async (req, res) => {
@@ -127,6 +156,8 @@ router.post('/register', async (req, res) => {
       subject: 'Verify your email — Safari CRM',
       html: verifyEmailTemplate({ userName: name, verifyUrl }),
     }).catch(err => console.error('Verify email send failed:', err.message));
+
+    notifyNewSignup({ org, user, signupSource: 'local' });
 
     const token = generateToken(user._id, user.tokenVersion);
     res.status(201).json({ token, user: { ...user.toObject(), password: undefined }, organization: org });
@@ -479,6 +510,8 @@ router.get('/google/callback', async (req, res) => {
         await org.save();
 
         await seedStarterPipelines(org._id);
+
+        notifyNewSignup({ org, user, signupSource: 'google' });
       }
     }
 

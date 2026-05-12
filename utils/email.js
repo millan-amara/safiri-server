@@ -205,6 +205,43 @@ export function welcomeEmail({ userName, loginUrl, orgName }) {
   `, orgName);
 }
 
+// Operator-facing internal alert sent on every new org signup. Surfaces the
+// info the founder needs to reach out (name, email, phone, signup channel)
+// without having to crack open Atlas or the admin dashboard. Not wrapped
+// with operator branding — this is an internal ops mail.
+export function signupNotificationEmail({ orgName, userName, userEmail, userPhone, signupSource, isoTimestamp }) {
+  const row = (k, v) => `
+    <tr>
+      <td style="padding: 6px 12px 6px 0; color: ${COLORS.muted}; font-size: 13px; vertical-align: top; white-space: nowrap;">${escapeHtml(k)}</td>
+      <td style="padding: 6px 0; color: ${COLORS.text}; font-size: 13px; word-break: break-word;">${v || '<span style="color: #9CA3AF;">—</span>'}</td>
+    </tr>
+  `;
+  // Phone is rendered as both plain text and a wa.me / tel: link so the
+  // founder can WhatsApp them in one tap from their mail client.
+  const digits = (userPhone || '').replace(/[^0-9]/g, '');
+  const phoneCell = userPhone
+    ? `${escapeHtml(userPhone)}${digits.length >= 6 ? ` &nbsp;<a href="https://wa.me/${digits}" style="color: ${COLORS.primary};">WhatsApp</a> · <a href="tel:${digits}" style="color: ${COLORS.primary};">Call</a>` : ''}`
+    : '';
+  const when = isoTimestamp ? new Date(isoTimestamp).toLocaleString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+  return wrap(`
+    <h3 style="color: ${COLORS.text}; font-size: 18px; margin: 0 0 8px;">🎉 New signup</h3>
+    <p style="color: ${COLORS.muted}; font-size: 14px; line-height: 1.6; margin: 0 0 20px;">
+      A new organization just signed up on ${escapeHtml(APP_NAME)}.
+    </p>
+    <table style="width: 100%; border-collapse: collapse; border: 1px solid ${COLORS.border}; border-radius: 8px; overflow: hidden;">
+      ${row('Organization', escapeHtml(orgName))}
+      ${row('Owner', escapeHtml(userName))}
+      ${row('Email', userEmail ? `<a href="mailto:${escapeAttr(userEmail)}" style="color: ${COLORS.primary};">${escapeHtml(userEmail)}</a>` : '')}
+      ${row('Phone', phoneCell)}
+      ${row('Source', escapeHtml(signupSource || 'local'))}
+      ${row('When', escapeHtml(when))}
+    </table>
+    <p style="color: ${COLORS.subtle}; font-size: 12px; margin-top: 24px;">
+      Open the operator dashboard to grant credits, extend the trial, or follow up.
+    </p>
+  `);
+}
+
 export function verifyEmailTemplate({ userName, verifyUrl }) {
   const safeName = escapeHtml(userName);
   const safeUrl = escapeAttr(verifyUrl);
