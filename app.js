@@ -34,6 +34,7 @@ import { checkInactiveDeals, checkOverdueTasks } from './automations/engine.js';
 import { startReminderPoller } from './queues/reminderPoller.js';
 import { startScheduledMessagePoller } from './queues/scheduledMessagePoller.js';
 import { startWebhookRetryPoller } from './queues/webhookRetryPoller.js';
+import { startFxRefresh } from './utils/fx.js';
 
 dotenv.config();
 
@@ -386,6 +387,10 @@ const start = async () => {
 
     // Webhook retry poller — re-attempts pending invoice webhooks per backoff
     startWebhookRetryPoller();
+
+    // Live FX rates — boot fetch + 12h refresh. Falls back to hardcoded
+    // USD_BASE on failure so quoting never blocks on the provider.
+    startFxRefresh();
   });
 };
 
