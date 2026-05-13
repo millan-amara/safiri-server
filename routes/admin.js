@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import Organization from '../models/Organization.js';
 import User from '../models/User.js';
 import AiUsageLog from '../models/AiUsageLog.js';
+import SearchLog from '../models/SearchLog.js';
 import Quote from '../models/Quote.js';
 import { Deal } from '../models/Deal.js';
 import Invoice from '../models/Invoice.js';
@@ -1174,6 +1175,121 @@ router.post('/users/:id/set-active', async (req, res) => {
     console.log(`[admin] ${req.user.email} set isActive=${isActive} on ${user.email}${reason ? ` — ${reason}` : ''}`);
     res.json({ message: `${user.email} ${isActive ? 'enabled' : 'disabled'}.`, isActive: user.isActive });
   } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── GET /api/admin/search-logs ─────────────────────────────────────────────
+// Cross-org view of every /api/search call (auto-pruned after 90 days). Used
+// to spot patterns ("most queries are diagnostic", "operators keep asking
+// about cancellations") and to find queries that returned nothing so we can
+// fix the parser or the inventory.
+//
+// Filters: q (substring on raw query), intent, outcome, orgId, from, to.
+// Pagination: page (default 1), limit (default 50, max 200).
+router.get('/search-logs', async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const skip = (page - 1) * limit;
+
+    const filter = {};
+    if (req.query.intent) filter.intent = req.query.intent;
+    if (req.query.outcome) filter.outcome = req.query.outcome;
+    if (req.query.orgId) {
+      try { filter.organization = new mongoose.Types.ObjectId(String(req.query.orgId)); } catch { /* invalid id */ }
+    }
+    if (req.query.q) {
+      const escapedQ = req.query.q.toString().trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      filter.query = { $regex: escapedQ, $options: 'i' };
+    }
+    if (req.query.from || req.query.to) {
+      filter.createdAt = {};
+      if (req.query.from) filter.createdAt.$gte = new Date(req.query.from);
+      if (req.query.to) filter.createdAt.$lte = new Date(req.query.to);
+    }
+
+    const [items, total] = await Promise.all([
+      SearchLog.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate('organization', 'name plan subscriptionStatus')
+        .populate('user', 'name email')
+        .lean(),
+      SearchLog.countDocuments(filter),
+    ]);
+
+    res.json({ items, total, page, limit });
+  } catch (err) {
+    console.error('[admin/search-logs] failed:', err);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── GET /api/admin/search-logs/stats ────────────────────────────────────────
+// Lightweight aggregates for the dashboard hero strip — counts last 7d/30d,
+// breakdown by intent, breakdown by outcome, top destinations, top mustHave
+// terms. Always org-scoped via the same filter as /search-logs.
+router.get('/search-logs/stats', async (req, res) => {
+  try {
+    const ago7 = daysAgo(7);
+    const ago30 = daysAgo(30);
+
+    const baseMatch = {};
+    if (req.query.orgId) {
+      try { baseMatch.organization = new mongoose.Types.ObjectId(String(req.query.orgId)); } catch { /* invalid id */ }
+    }
+
+    const [counts, byIntent, byOutcome, topDestinations, topMustHave, zeroResultQueries] = await Promise.all([
+      SearchLog.aggregate([{ $match: baseMatch }, { $facet: {
+        total: [{ $count: 'n' }],
+        last7d: [{ $match: { createdAt: { $gte: ago7 } } }, { $count: 'n' }],
+        last30d: [{ $match: { createdAt: { $gte: ago30 } } }, { $count: 'n' }],
+      } }]),
+      SearchLog.aggregate([
+        { $match: { ...baseMatch, createdAt: { $gte: ago30 } } },
+        { $group: { _id: '$intent', count: { $sum: 1 } } },
+      ]),
+      SearchLog.aggregate([
+        { $match: { ...baseMatch, createdAt: { $gte: ago30 } } },
+        { $group: { _id: '$outcome', count: { $sum: 1 } } },
+      ]),
+      SearchLog.aggregate([
+        { $match: { ...baseMatch, createdAt: { $gte: ago30 }, 'parsed.destinationName': { $ne: null } } },
+        { $group: { _id: '$parsed.destinationName', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 10 },
+      ]),
+      SearchLog.aggregate([
+        { $match: { ...baseMatch, createdAt: { $gte: ago30 } } },
+        { $unwind: '$parsed.mustHave' },
+        { $group: { _id: { $toLower: '$parsed.mustHave' }, count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 10 },
+      ]),
+      SearchLog.aggregate([
+        // Queries that returned nothing — the high-signal feedback loop for
+        // "what's the parser/inventory missing?".
+        { $match: { ...baseMatch, createdAt: { $gte: ago30 }, outcome: 'no_results' } },
+        { $group: { _id: { $toLower: '$query' }, count: { $sum: 1 }, last: { $max: '$createdAt' } } },
+        { $sort: { count: -1, last: -1 } },
+        { $limit: 10 },
+      ]),
+    ]);
+
+    res.json({
+      total: num(counts[0]?.total),
+      last7d: num(counts[0]?.last7d),
+      last30d: num(counts[0]?.last30d),
+      byIntent: groupToObj(byIntent),
+      byOutcome: groupToObj(byOutcome),
+      topDestinations: topDestinations.map(d => ({ name: d._id, count: d.count })),
+      topMustHave: topMustHave.map(d => ({ term: d._id, count: d.count })),
+      zeroResultQueries: zeroResultQueries.map(d => ({ query: d._id, count: d.count, last: d.last })),
+    });
+  } catch (err) {
+    console.error('[admin/search-logs/stats] failed:', err);
     res.status(500).json({ message: err.message });
   }
 });

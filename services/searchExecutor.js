@@ -12,13 +12,15 @@ import Activity from '../models/Activity.js';
 import Transport from '../models/Transport.js';
 import Package from '../models/Package.js';
 import Destination from '../models/Destination.js';
-import { priceStay, summarizeCheapestRate } from './rateResolver.js';
+import { priceStay, summarizeCheapestRate, findCheapestPerPerson } from './rateResolver.js';
 import { priceActivity } from './activityPricer.js';
 import { priceTransport } from './transportPricer.js';
 import { pricePackage } from './packagePricer.js';
 import { embedText } from './embeddings.js';
 
 const HOTEL_VECTOR_INDEX = 'hotel_embeddings_v1';
+const ACTIVITY_VECTOR_INDEX = 'activity_embeddings_v1';
+const TRANSPORT_VECTOR_INDEX = 'transport_embeddings_v1';
 
 const RESULT_CAP = 10;
 const DEFAULT_NIGHTS_WHEN_ONLY_FROM = 3;
@@ -164,6 +166,89 @@ async function fetchHotelsByVector({ organizationId, query, canonical, mustHave,
   }
 }
 
+async function fetchActivitiesByVector({ organizationId, query, canonical, mustHave }) {
+  const embedInput = [query, ...(mustHave || [])].filter(Boolean).join(' ').trim();
+  if (!embedInput) return null;
+
+  let vector;
+  try {
+    const r = await embedText(embedInput, { inputType: 'query' });
+    vector = r.vector;
+  } catch (err) {
+    console.warn('[search] Voyage embedding failed (activities):', err.message);
+    return null;
+  }
+  if (!vector) return null;
+
+  const orgObjectId = new mongoose.Types.ObjectId(String(organizationId));
+  const pipeline = [
+    {
+      $vectorSearch: {
+        index: ACTIVITY_VECTOR_INDEX,
+        path: 'embeddingV1',
+        queryVector: vector,
+        numCandidates: 200,
+        limit: 100,
+        filter: { organization: orgObjectId, isActive: true },
+      },
+    },
+    { $project: { embeddingV1: 0 } },
+  ];
+  if (canonical) {
+    pipeline.push({ $match: { destination: flexibleTermRegex(canonical) } });
+  }
+  pipeline.push({ $limit: 50 });
+
+  try {
+    return await Activity.aggregate(pipeline);
+  } catch (err) {
+    console.warn('[search] $vectorSearch failed (activities):', err.message);
+    return null;
+  }
+}
+
+async function fetchTransportByVector({ organizationId, query, canonical, mustHave }) {
+  const embedInput = [query, ...(mustHave || [])].filter(Boolean).join(' ').trim();
+  if (!embedInput) return null;
+
+  let vector;
+  try {
+    const r = await embedText(embedInput, { inputType: 'query' });
+    vector = r.vector;
+  } catch (err) {
+    console.warn('[search] Voyage embedding failed (transport):', err.message);
+    return null;
+  }
+  if (!vector) return null;
+
+  const orgObjectId = new mongoose.Types.ObjectId(String(organizationId));
+  const pipeline = [
+    {
+      $vectorSearch: {
+        index: TRANSPORT_VECTOR_INDEX,
+        path: 'embeddingV1',
+        queryVector: vector,
+        numCandidates: 200,
+        limit: 100,
+        filter: { organization: orgObjectId, isActive: true },
+      },
+    },
+    { $project: { embeddingV1: 0 } },
+  ];
+  if (canonical) {
+    const re = flexibleTermRegex(canonical);
+    pipeline.push({ $match: { $or: [{ destinations: re }, { routeOrZone: re }] } });
+  }
+  pipeline.push({ $limit: 50 });
+
+  try {
+    return await Transport.aggregate(pipeline);
+  } catch (err) {
+    console.warn('[search] $vectorSearch failed (transport):', err.message);
+    return null;
+  }
+}
+
 async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, query, warnings }) {
   // Vibe path: when the operator gave qualitative cues ("luxury", "tented",
   // "kid-friendly"), use Voyage embeddings + Atlas $vectorSearch. Pure
@@ -184,16 +269,15 @@ async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, 
     //
     // Multiple clauses (destination, propertyType, mustHave) are AND'd together
     // via $and so independent $or conditions don't clobber each other.
-    const filter = { organization: organizationId, isActive: true };
-    const conjuncts = [];
+    const baseConjuncts = [];
 
     if (canonical) {
       const re = flexibleTermRegex(canonical);
-      conjuncts.push({ $or: [{ destination: re }, { location: re }] });
+      baseConjuncts.push({ $or: [{ destination: re }, { location: re }] });
     }
 
     const ptClause = buildPropertyTypeClause(parsed.propertyType);
-    if (ptClause) conjuncts.push(ptClause);
+    if (ptClause) baseConjuncts.push(ptClause);
 
     // mustHave terms — match against multiple text-bearing fields. Property-type
     // words have already been promoted to parsed.propertyType by the parser so
@@ -201,10 +285,26 @@ async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, 
     const mustHaveFilter = buildMustHaveFilter(parsed.mustHave, [
       'name', 'description', 'tags', 'amenities', 'location',
     ]);
-    if (mustHaveFilter) conjuncts.push(mustHaveFilter);
 
-    if (conjuncts.length) filter.$and = conjuncts;
-    hotels = await Hotel.find(filter).limit(50).lean();
+    const tryFilter = async (extraConjunct) => {
+      const filter = { organization: organizationId, isActive: true };
+      const conjuncts = extraConjunct ? [...baseConjuncts, extraConjunct] : [...baseConjuncts];
+      if (conjuncts.length) filter.$and = conjuncts;
+      return Hotel.find(filter).limit(50).lean();
+    };
+
+    hotels = await tryFilter(mustHaveFilter);
+
+    // Loosen on zero: if the strict filter returned nothing AND mustHave was
+    // doing the narrowing, retry without it. Catches the case where the parser
+    // left a sort cue ("cheapest", "best") in mustHave that no record's name
+    // or description literally contains.
+    if (hotels.length === 0 && mustHaveFilter) {
+      hotels = await tryFilter(null);
+      if (hotels.length > 0 && Array.isArray(warnings)) {
+        warnings.push(`No hotels matched "${(parsed.mustHave || []).join(', ')}" exactly — showing all matching properties instead.`);
+      }
+    }
   }
   if (!hotels.length) return [];
 
@@ -359,8 +459,11 @@ async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, 
         });
       }
     } else {
-      // No dates — use summarizeCheapestRate for a "from $X per person" signal.
-      const summary = summarizeCheapestRate(hotel, { clientType, quoteCurrency, orgFxOverrides: {} });
+      // No dates — find the ABSOLUTE cheapest perPersonSharing across every
+      // active rate list × season × room. summarizeCheapestRate only scans
+      // the highest-priority list's today-covering season, which silently
+      // misranks hotels whose cheapest season isn't today's.
+      const summary = findCheapestPerPerson(hotel, { clientType, quoteCurrency, orgFxOverrides: {} });
       if (!summary) continue;
 
       const perPerson = summary.perPersonSharingInQuoteCurrency || 0;
@@ -418,16 +521,25 @@ async function searchHotels({ parsed, organizationId, canonical, quoteCurrency, 
 
 // ─── ACTIVITIES ───────────────────────────────────────────────────────────────
 
-async function searchActivities({ parsed, organizationId, canonical, quoteCurrency }) {
-  const filter = { organization: organizationId, isActive: true };
-  if (canonical) filter.destination = flexibleTermRegex(canonical);
+async function searchActivities({ parsed, organizationId, canonical, quoteCurrency, query }) {
+  // Vibe path: vector search when the operator gave qualitative cues
+  // ("scenic walking", "kid-friendly cultural visit"). Same pattern as hotels.
+  let activities = null;
+  if (parsed.mustHave?.length && query) {
+    activities = await fetchActivitiesByVector({
+      organizationId, query, canonical, mustHave: parsed.mustHave,
+    });
+  }
 
-  const mustHaveFilter = buildMustHaveFilter(parsed.mustHave, [
-    'name', 'description', 'tags',
-  ]);
-  if (mustHaveFilter) Object.assign(filter, mustHaveFilter);
-
-  const activities = await Activity.find(filter).limit(50).lean();
+  if (!activities || activities.length === 0) {
+    const filter = { organization: organizationId, isActive: true };
+    if (canonical) filter.destination = flexibleTermRegex(canonical);
+    const mustHaveFilter = buildMustHaveFilter(parsed.mustHave, [
+      'name', 'description', 'tags',
+    ]);
+    if (mustHaveFilter) Object.assign(filter, mustHaveFilter);
+    activities = await Activity.find(filter).limit(50).lean();
+  }
   if (!activities.length) return [];
 
   const adults = parsed.adults ?? 0;
@@ -479,19 +591,28 @@ async function searchActivities({ parsed, organizationId, canonical, quoteCurren
 
 // ─── TRANSPORT ────────────────────────────────────────────────────────────────
 
-async function searchTransport({ parsed, organizationId, canonical, quoteCurrency }) {
-  const filter = { organization: organizationId, isActive: true };
-  if (canonical) {
-    const re = flexibleTermRegex(canonical);
-    filter.$or = [{ destinations: re }, { routeOrZone: re }];
+async function searchTransport({ parsed, organizationId, canonical, quoteCurrency, query }) {
+  // Vibe path: same as hotels/activities, but only triggered when there's a
+  // qualitative cue (otherwise plain regex on route/destinations is enough).
+  let transports = null;
+  if (parsed.mustHave?.length && query) {
+    transports = await fetchTransportByVector({
+      organizationId, query, canonical, mustHave: parsed.mustHave,
+    });
   }
 
-  const mustHaveFilter = buildMustHaveFilter(parsed.mustHave, [
-    'name', 'notes', 'type', 'routeOrZone',
-  ]);
-  if (mustHaveFilter) Object.assign(filter, mustHaveFilter);
-
-  const transports = await Transport.find(filter).limit(50).lean();
+  if (!transports || transports.length === 0) {
+    const filter = { organization: organizationId, isActive: true };
+    if (canonical) {
+      const re = flexibleTermRegex(canonical);
+      filter.$or = [{ destinations: re }, { routeOrZone: re }];
+    }
+    const mustHaveFilter = buildMustHaveFilter(parsed.mustHave, [
+      'name', 'notes', 'type', 'routeOrZone',
+    ]);
+    if (mustHaveFilter) Object.assign(filter, mustHaveFilter);
+    transports = await Transport.find(filter).limit(50).lean();
+  }
   if (!transports.length) return [];
 
   const adults = parsed.adults ?? 0;
@@ -890,6 +1011,259 @@ export async function executeLookup({ parsed, organizationId }) {
       location: c.location || null,
       image: pickHeroImage(c.images),
     })),
+  };
+}
+
+// ─── DIAGNOSTIC (inventory audit) ─────────────────────────────────────────────
+// Operator-facing data-quality queries: "hotels missing rate lists", "rate lists
+// expiring this month", "hotels without images", etc. All are deterministic
+// Mongo queries — no LLM ranking, no pricing. The parser does the only LLM
+// work (intent + sub-type detection), the executor returns a clean list with
+// an issue label per row so the UI can render "fix this" actions.
+
+const DIAGNOSTIC_LABELS = {
+  missing_rate_lists: 'Missing rate lists',
+  expiring_rate_lists: 'Rate lists expiring soon',
+  expired_rate_lists: 'Rate lists past validity',
+  missing_images: 'Missing images',
+  low_confidence_rates: 'Low-confidence rate lists',
+  blocking_conditions: 'Unacknowledged blocking conditions',
+};
+
+const EXPIRING_WINDOW_DAYS = 60;
+const DIAGNOSTIC_CAP = 50;
+
+async function diagMissingRateLists({ organizationId, canonical }) {
+  const filter = {
+    organization: organizationId,
+    isActive: true,
+    $or: [
+      { rateLists: { $exists: false } },
+      { rateLists: { $size: 0 } },
+      { rateLists: { $not: { $elemMatch: { isActive: { $ne: false } } } } },
+    ],
+  };
+  if (canonical) {
+    const re = flexibleTermRegex(canonical);
+    filter.$and = [{ $or: [{ destination: re }, { location: re }] }];
+  }
+  const hotels = await Hotel.find(filter)
+    .select('name destination location images')
+    .limit(DIAGNOSTIC_CAP)
+    .sort({ name: 1 })
+    .lean();
+  return hotels.map(h => ({
+    type: 'hotel',
+    id: h._id,
+    name: h.name,
+    destination: h.destination,
+    location: h.location || '',
+    image: pickHeroImage(h.images),
+    issue: 'missing_rate_lists',
+    issueDetail: 'No active rate lists configured — can\'t be quoted.',
+  }));
+}
+
+async function diagMissingImages({ organizationId, canonical }) {
+  const filter = {
+    organization: organizationId,
+    isActive: true,
+    $or: [
+      { images: { $exists: false } },
+      { images: { $size: 0 } },
+    ],
+  };
+  if (canonical) {
+    const re = flexibleTermRegex(canonical);
+    filter.$and = [{ $or: [{ destination: re }, { location: re }] }];
+  }
+  const hotels = await Hotel.find(filter)
+    .select('name destination location')
+    .limit(DIAGNOSTIC_CAP)
+    .sort({ name: 1 })
+    .lean();
+  return hotels.map(h => ({
+    type: 'hotel',
+    id: h._id,
+    name: h.name,
+    destination: h.destination,
+    location: h.location || '',
+    image: null,
+    issue: 'missing_images',
+    issueDetail: 'No images on file — quote will render without a hero photo.',
+  }));
+}
+
+// Helper: build the $match stage scoped to the org (+ optional destination)
+// for aggregate pipelines.
+function diagAggregateMatch({ organizationId, canonical }) {
+  const m = { organization: new mongoose.Types.ObjectId(String(organizationId)), isActive: true };
+  if (canonical) {
+    const re = flexibleTermRegex(canonical);
+    m.$or = [{ destination: re }, { location: re }];
+  }
+  return m;
+}
+
+async function diagExpiringRateLists({ organizationId, canonical, expired = false }) {
+  const now = new Date();
+  const horizon = new Date(now.getTime() + EXPIRING_WINDOW_DAYS * 86400000);
+  const dateMatch = expired
+    ? { 'rateLists.validTo': { $lt: now } }
+    : { 'rateLists.validTo': { $gte: now, $lte: horizon } };
+
+  const rows = await Hotel.aggregate([
+    { $match: diagAggregateMatch({ organizationId, canonical }) },
+    { $unwind: '$rateLists' },
+    { $match: { 'rateLists.isActive': { $ne: false }, ...dateMatch } },
+    { $sort: { 'rateLists.validTo': expired ? -1 : 1 } },
+    { $limit: DIAGNOSTIC_CAP },
+    { $project: {
+      _id: 1, name: 1, destination: 1, location: 1, images: 1,
+      'rateListName': '$rateLists.name', 'validTo': '$rateLists.validTo',
+    } },
+  ]);
+
+  return rows.map(r => {
+    const daysUntil = Math.round((new Date(r.validTo) - now) / 86400000);
+    const dateStr = new Date(r.validTo).toISOString().slice(0, 10);
+    const issueDetail = expired
+      ? `Rate list "${r.rateListName}" expired ${dateStr} (${Math.abs(daysUntil)} day${Math.abs(daysUntil) === 1 ? '' : 's'} ago).`
+      : `Rate list "${r.rateListName}" expires ${dateStr} (in ${daysUntil} day${daysUntil === 1 ? '' : 's'}).`;
+    return {
+      type: 'hotel',
+      id: r._id,
+      name: r.name,
+      destination: r.destination,
+      location: r.location || '',
+      image: pickHeroImage(r.images),
+      issue: expired ? 'expired_rate_lists' : 'expiring_rate_lists',
+      issueDetail,
+      rateListName: r.rateListName,
+      expiresAt: r.validTo,
+      daysUntil,
+    };
+  });
+}
+
+async function diagLowConfidenceRates({ organizationId, canonical }) {
+  const filter = {
+    organization: organizationId,
+    isActive: true,
+    rateLists: { $elemMatch: {
+      isActive: { $ne: false },
+      extractionConfidence: 'low',
+    } },
+  };
+  if (canonical) {
+    const re = flexibleTermRegex(canonical);
+    filter.$and = [{ $or: [{ destination: re }, { location: re }] }];
+  }
+  const hotels = await Hotel.find(filter)
+    .select('name destination location images rateLists')
+    .limit(DIAGNOSTIC_CAP)
+    .sort({ name: 1 })
+    .lean();
+  return hotels.map(h => {
+    const lowList = (h.rateLists || []).find(l => l.isActive !== false && l.extractionConfidence === 'low');
+    return {
+      type: 'hotel',
+      id: h._id,
+      name: h.name,
+      destination: h.destination,
+      location: h.location || '',
+      image: pickHeroImage(h.images),
+      issue: 'low_confidence_rates',
+      issueDetail: `Rate list "${lowList?.name || '(unnamed)'}" was extracted with low confidence — verify before quoting.`,
+      rateListName: lowList?.name || null,
+    };
+  });
+}
+
+async function diagBlockingConditions({ organizationId, canonical }) {
+  const filter = {
+    organization: organizationId,
+    isActive: true,
+    rateLists: { $elemMatch: {
+      isActive: { $ne: false },
+      conditions: { $elemMatch: { severity: 'blocking', acknowledged: { $ne: true } } },
+    } },
+  };
+  if (canonical) {
+    const re = flexibleTermRegex(canonical);
+    filter.$and = [{ $or: [{ destination: re }, { location: re }] }];
+  }
+  const hotels = await Hotel.find(filter)
+    .select('name destination location images rateLists')
+    .limit(DIAGNOSTIC_CAP)
+    .sort({ name: 1 })
+    .lean();
+  return hotels.map(h => {
+    let listName = null, conditionText = null;
+    for (const l of (h.rateLists || [])) {
+      if (l.isActive === false) continue;
+      const cond = (l.conditions || []).find(c => c.severity === 'blocking' && !c.acknowledged);
+      if (cond) { listName = l.name; conditionText = cond.text; break; }
+    }
+    return {
+      type: 'hotel',
+      id: h._id,
+      name: h.name,
+      destination: h.destination,
+      location: h.location || '',
+      image: pickHeroImage(h.images),
+      issue: 'blocking_conditions',
+      issueDetail: conditionText
+        ? `Unacknowledged blocking condition on "${listName}": ${conditionText.slice(0, 180)}`
+        : 'Has an unacknowledged blocking condition.',
+      rateListName: listName,
+      conditionText,
+    };
+  });
+}
+
+/**
+ * Run the requested diagnostic against the org's hotel inventory.
+ * Returns { diagnostic, label, items, totalCount, warnings }.
+ */
+export async function executeDiagnostic({ parsed, organizationId }) {
+  const warnings = [];
+  const { canonical, destDoc } = await resolveDestination(parsed.destinationName, organizationId);
+  if (parsed.destinationName && !destDoc) {
+    warnings.push(`No destination matched "${parsed.destinationName}" exactly — scanning by name match.`);
+  }
+
+  let items = [];
+  switch (parsed.diagnostic) {
+    case 'missing_rate_lists':
+      items = await diagMissingRateLists({ organizationId, canonical });
+      break;
+    case 'expiring_rate_lists':
+      items = await diagExpiringRateLists({ organizationId, canonical, expired: false });
+      break;
+    case 'expired_rate_lists':
+      items = await diagExpiringRateLists({ organizationId, canonical, expired: true });
+      break;
+    case 'missing_images':
+      items = await diagMissingImages({ organizationId, canonical });
+      break;
+    case 'low_confidence_rates':
+      items = await diagLowConfidenceRates({ organizationId, canonical });
+      break;
+    case 'blocking_conditions':
+      items = await diagBlockingConditions({ organizationId, canonical });
+      break;
+    default:
+      items = [];
+  }
+
+  return {
+    diagnostic: parsed.diagnostic,
+    label: DIAGNOSTIC_LABELS[parsed.diagnostic] || 'Diagnostic',
+    items,
+    totalCount: items.length,
+    canonical,
+    warnings,
   };
 }
 

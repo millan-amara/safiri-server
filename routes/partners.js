@@ -11,7 +11,7 @@ import { requirePartnerQuota, enforceImageCap, enforceCsvRowCap } from '../middl
 import { priceStay } from '../services/rateResolver.js';
 import { priceActivity } from '../services/activityPricer.js';
 import { priceTransport } from '../services/transportPricer.js';
-import { ensureHotelEmbedding } from '../services/embeddings.js';
+import { ensureHotelEmbedding, ensureActivityEmbedding, ensureTransportEmbedding } from '../services/embeddings.js';
 import { checkPdfPages } from '../middleware/subscription.js';
 import { logAiCall, recordAiUsage } from '../utils/aiLogger.js';
 
@@ -498,6 +498,7 @@ router.get('/transport', protect, async (req, res) => {
 router.post('/transport', protect, authorize('owner', 'admin', 'agent'), requirePartnerQuota('transport'), enforceImageCap, async (req, res) => {
   try {
     const t = await Transport.create({ ...req.body, organization: req.organizationId });
+    ensureTransportEmbedding(t).catch(() => {});
     res.status(201).json(t);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -512,6 +513,7 @@ router.put('/transport/:id', protect, authorize('owner', 'admin', 'agent'), enfo
       { new: true }
     );
     if (!t) return res.status(404).json({ message: 'Not found' });
+    ensureTransportEmbedding(t).catch(() => {});
     res.json(t);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -574,6 +576,7 @@ router.get('/activities', protect, async (req, res) => {
 router.post('/activities', protect, authorize('owner', 'admin', 'agent'), requirePartnerQuota('activity'), enforceImageCap, async (req, res) => {
   try {
     const a = await Activity.create({ ...req.body, organization: req.organizationId });
+    ensureActivityEmbedding(a).catch(() => {});
     res.status(201).json(a);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -588,6 +591,7 @@ router.put('/activities/:id', protect, authorize('owner', 'admin', 'agent'), enf
       { new: true }
     );
     if (!a) return res.status(404).json({ message: 'Not found' });
+    ensureActivityEmbedding(a).catch(() => {});
     res.json(a);
   } catch (error) {
     res.status(500).json({ message: error.message });

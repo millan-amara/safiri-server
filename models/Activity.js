@@ -28,6 +28,16 @@ const activitySchema = new mongoose.Schema({
   currency: { type: String, default: 'KES' },
   notes: { type: String, default: '' },
   isActive: { type: Boolean, default: true },
+
+  // ── Pass-3 search embedding (mirrors Hotel.embeddingV1) ────────────────
+  // Voyage AI semantic vector for vibe queries on activities ("scenic walking
+  // safari", "kid-friendly cultural visit"). Populated by the backfill script
+  // and on activity POST/PUT when the source content changes. Searched via
+  // Atlas $vectorSearch index 'activity_embeddings_v1'.
+  embeddingV1: { type: [Number], default: undefined, select: false },
+  embeddingV1Model: { type: String, default: '' },
+  embeddingV1SourceHash: { type: String, default: '' },
+  embeddingV1UpdatedAt: { type: Date },
 }, { timestamps: true });
 
 activitySchema.index({ organization: 1, destination: 1 });

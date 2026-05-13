@@ -25,6 +25,16 @@ const transportSchema = new mongoose.Schema({
   currency: { type: String, default: 'KES' },
   notes: { type: String, default: '' },
   isActive: { type: Boolean, default: true },
+
+  // ── Pass-3 search embedding (mirrors Hotel.embeddingV1) ────────────────
+  // Voyage AI semantic vector for vibe queries on transport ("romantic boat
+  // transfer", "comfortable airport pickup"). Populated by the backfill
+  // script and on transport POST/PUT when the source content changes.
+  // Searched via Atlas $vectorSearch index 'transport_embeddings_v1'.
+  embeddingV1: { type: [Number], default: undefined, select: false },
+  embeddingV1Model: { type: String, default: '' },
+  embeddingV1SourceHash: { type: String, default: '' },
+  embeddingV1UpdatedAt: { type: Date },
 }, { timestamps: true });
 
 transportSchema.index({ organization: 1 });

@@ -49,6 +49,43 @@ export function buildHotelEmbeddingSource(hotel) {
   return trim(parts.join('\n'));
 }
 
+/**
+ * Activity embedding source — what would an operator match against?
+ * Name, destination, description, duration, season, tags, minimum age, notes.
+ * Pricing is excluded since it doesn't describe the activity's character.
+ */
+export function buildActivityEmbeddingSource(activity) {
+  if (!activity) return '';
+  const parts = [];
+  if (activity.name) parts.push(activity.name);
+  if (activity.destination) parts.push(`destination: ${activity.destination}`);
+  if (activity.description) parts.push(activity.description);
+  if (activity.duration) parts.push(`${activity.duration} hours`);
+  if (activity.season && activity.season !== 'all') parts.push(`${activity.season} season`);
+  if (activity.minimumAge) parts.push(`minimum age: ${activity.minimumAge}`);
+  if (activity.tags?.length) parts.push(`tags: ${activity.tags.join(', ')}`);
+  if (activity.notes) parts.push(activity.notes);
+  return trim(parts.join('\n'));
+}
+
+/**
+ * Transport embedding source — name, type (normalized), route/zone, served
+ * destinations, capacity, pricing model, notes. Type underscores are flattened
+ * so "4x4" / "minibus" / "helicopter" match phrasing variants.
+ */
+export function buildTransportEmbeddingSource(transport) {
+  if (!transport) return '';
+  const parts = [];
+  if (transport.name) parts.push(transport.name);
+  if (transport.type) parts.push(`type: ${String(transport.type).replace(/_/g, ' ')}`);
+  if (transport.capacity) parts.push(`${transport.capacity} pax capacity`);
+  if (transport.routeOrZone) parts.push(`route: ${transport.routeOrZone}`);
+  if (transport.destinations?.length) parts.push(`destinations: ${transport.destinations.join(', ')}`);
+  if (transport.pricingModel) parts.push(`pricing: ${transport.pricingModel}`);
+  if (transport.notes) parts.push(transport.notes);
+  return trim(parts.join('\n'));
+}
+
 export function hashSource(source) {
   return crypto.createHash('sha1').update(source || '').digest('hex');
 }
@@ -101,27 +138,18 @@ export async function embedText(text, { inputType = 'query' } = {}) {
   return { vector: vectors[0], totalTokens };
 }
 
-/**
- * Re-embed a single hotel if its source content has changed (or it's never
- * been embedded). Designed to be called fire-and-forget from create/update
- * handlers — caller does not need to await; failures are logged, not thrown.
- *
- * Skips when the source-hash + model already match, so it's safe to call on
- * every save even when only price/contact/image fields changed.
- */
-export async function ensureHotelEmbedding(hotelDoc) {
-  if (!hotelDoc?._id) return;
-  // Lazy import to avoid pulling the Hotel model into modules that only need
-  // the raw embedText/embedDocuments primitives.
-  const { default: Hotel } = await import('../models/Hotel.js');
-
-  const source = buildHotelEmbeddingSource(hotelDoc);
+// Generic re-embed helper. Hash-gated so it's safe to call on every save;
+// failures are logged, not thrown. Caller invokes the kind-specific wrapper
+// below (ensureHotelEmbedding / ensureActivityEmbedding / ensureTransportEmbedding).
+async function ensureEmbedding({ doc, model, buildSource, label }) {
+  if (!doc?._id) return;
+  const source = buildSource(doc);
   if (!source) return;
   const hash = hashSource(source);
 
-  // The doc passed in may be lean (no embedding fields) or a Mongoose doc;
-  // re-fetch the meta so we don't accidentally re-embed when nothing changed.
-  const meta = await Hotel.findById(hotelDoc._id)
+  // Re-fetch meta so we skip if nothing relevant changed (the doc passed in
+  // may be lean and not carry embedding metadata).
+  const meta = await model.findById(doc._id)
     .select('embeddingV1SourceHash embeddingV1Model')
     .lean();
   if (meta?.embeddingV1SourceHash === hash && meta?.embeddingV1Model === EMBEDDING_MODEL) {
@@ -131,8 +159,8 @@ export async function ensureHotelEmbedding(hotelDoc) {
   try {
     const { vector } = await embedText(source, { inputType: 'document' });
     if (!vector) return;
-    await Hotel.updateOne(
-      { _id: hotelDoc._id },
+    await model.updateOne(
+      { _id: doc._id },
       {
         $set: {
           embeddingV1: vector,
@@ -143,8 +171,34 @@ export async function ensureHotelEmbedding(hotelDoc) {
       }
     );
   } catch (err) {
-    console.error(`[embeddings] Failed to embed hotel ${hotelDoc._id}:`, err.message);
+    console.error(`[embeddings] Failed to embed ${label} ${doc._id}:`, err.message);
   }
+}
+
+/**
+ * Re-embed a single hotel if its source content has changed. Fire-and-forget.
+ */
+export async function ensureHotelEmbedding(hotelDoc) {
+  // Lazy import to avoid pulling models into modules that only need the
+  // raw embedText/embedDocuments primitives.
+  const { default: Hotel } = await import('../models/Hotel.js');
+  return ensureEmbedding({ doc: hotelDoc, model: Hotel, buildSource: buildHotelEmbeddingSource, label: 'hotel' });
+}
+
+/**
+ * Re-embed a single activity. Same fire-and-forget semantics as hotel.
+ */
+export async function ensureActivityEmbedding(activityDoc) {
+  const { default: Activity } = await import('../models/Activity.js');
+  return ensureEmbedding({ doc: activityDoc, model: Activity, buildSource: buildActivityEmbeddingSource, label: 'activity' });
+}
+
+/**
+ * Re-embed a single transport. Same fire-and-forget semantics as hotel.
+ */
+export async function ensureTransportEmbedding(transportDoc) {
+  const { default: Transport } = await import('../models/Transport.js');
+  return ensureEmbedding({ doc: transportDoc, model: Transport, buildSource: buildTransportEmbeddingSource, label: 'transport' });
 }
 
 /**

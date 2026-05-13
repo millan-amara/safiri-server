@@ -862,3 +862,43 @@ export function summarizeCheapestRate(hotel, { clientType = 'retail', date = new
   }
   return null;
 }
+
+// Absolute-minimum scan: walk every active rate list × every season × every
+// room and return the lowest perPersonSharing converted to quote currency.
+//
+// This is what /api/search uses for the no-dates "cheapest hotel in X" path —
+// where summarizeCheapestRate falls short because it only looks at the
+// highest-priority list's today-covering season, not the global minimum.
+//
+// Returns the same shape as summarizeCheapestRate so callers can swap in
+// without UI changes, plus a `seasonLabel` so the operator can see WHICH
+// season produced the price ("from $180 in Low Season").
+export function findCheapestPerPerson(hotel, { clientType = 'retail', quoteCurrency = 'USD', orgFxOverrides = {} } = {}) {
+  const lists = (hotel.rateLists || [])
+    .filter(l => l.isActive !== false && audienceMatches(l.audience, clientType));
+  if (!lists.length) return null;
+
+  let best = null;
+  for (const list of lists) {
+    for (const season of (list.seasons || [])) {
+      for (const room of (season.rooms || [])) {
+        const perPersonSource = room.perPersonSharing || room.singleOccupancy || 0;
+        if (!perPersonSource) continue;
+        const perPersonQuote = convert(perPersonSource, list.currency, quoteCurrency, orgFxOverrides);
+        if (!best || perPersonQuote < best.perPersonSharingInQuoteCurrency) {
+          best = {
+            rateListName: list.name,
+            mealPlan: list.mealPlan,
+            roomType: room.roomType,
+            seasonLabel: season.label || '',
+            perPersonSharing: perPersonSource,
+            sourceCurrency: list.currency,
+            perPersonSharingInQuoteCurrency: perPersonQuote,
+            label: `${Math.round(perPersonQuote)} ${quoteCurrency}/pp sharing (${list.mealPlan}${season.label ? `, ${season.label}` : ''})`,
+          };
+        }
+      }
+    }
+  }
+  return best;
+}

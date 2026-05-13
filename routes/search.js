@@ -14,8 +14,9 @@ import { checkAiCredits } from '../middleware/subscription.js';
 import { logAiCall, recordAiUsage } from '../utils/aiLogger.js';
 import { AI_CREDIT_COST, getPlan } from '../config/plans.js';
 import { parseQuery } from '../services/searchParser.js';
-import { executeSearch, executeLookup } from '../services/searchExecutor.js';
+import { executeSearch, executeLookup, executeDiagnostic } from '../services/searchExecutor.js';
 import { generateRationales, generateLookupAnswer } from '../services/searchRationale.js';
+import { logSearch } from '../utils/searchLogger.js';
 
 const router = Router();
 router.use(protect);
@@ -38,8 +39,29 @@ router.post(
   checkAiCredits(AI_CREDIT_COST.search),
   logAiCall('search'),
   async (req, res) => {
+    const t0 = Date.now();
+    let effectiveParsed = null;
+    let query = '';
+
+    // Build a per-request closure so each return point logs with one line.
+    // Fire-and-forget — never blocks the response, never throws.
+    const log = (outcome, opts = {}) => logSearch({
+      organization: req.organizationId,
+      user: req.user?._id,
+      query,
+      intent: opts.intent ?? effectiveParsed?.intent ?? 'search',
+      parsed: opts.parsed ?? effectiveParsed,
+      outcome,
+      resultCount: opts.resultCount ?? 0,
+      // "Attempted" signal: the route would have tried the vector path when
+      // mustHave > 0 and intent=search. We don't (yet) thread the real
+      // succeeded/fell-back flag back from the executor — proxy is good enough.
+      vectorPathUsed: !!opts.vectorPathUsed,
+      ms: Date.now() - t0,
+    });
+
     try {
-      const query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
+      query = typeof req.body?.query === 'string' ? req.body.query.trim() : '';
       if (!query) return res.status(400).json({ message: 'Query is required.' });
       if (query.length > 500) return res.status(400).json({ message: 'Query too long (max 500 chars).' });
 
@@ -52,7 +74,7 @@ router.post(
       const forcedType = ['hotel', 'activity', 'transport', 'package'].includes(req.body?.type)
         ? req.body.type
         : null;
-      const effectiveParsed = forcedType ? { ...parsed, type: forcedType } : parsed;
+      effectiveParsed = forcedType ? { ...parsed, type: forcedType } : parsed;
 
       // ── Lookup intent: Q&A about a specific named partner ────────────────
       // The parser sets intent='lookup' when the operator is asking ABOUT a
@@ -68,6 +90,7 @@ router.post(
 
         // Multiple matches — return slim candidates and ask the operator to pick.
         if (!lookupResult.lookup && lookupResult.candidates.length > 0) {
+          log('lookup_candidates', { resultCount: lookupResult.candidates.length });
           return res.json({
             intent: 'lookup',
             parsed: effectiveParsed,
@@ -79,6 +102,7 @@ router.post(
 
         // No matches — clarification.
         if (!lookupResult.lookup && lookupResult.candidates.length === 0) {
+          log('clarification');
           return res.json({
             intent: 'lookup',
             parsed: effectiveParsed,
@@ -105,12 +129,36 @@ router.post(
           console.error('[search] lookup answer generation failed:', err.message);
         }
 
+        log('lookup_answer', { resultCount: 1 });
         return res.json({
           intent: 'lookup',
           parsed: effectiveParsed,
           lookup: lookupResult.lookup,
           candidates: [],
           answer,
+        });
+      }
+
+      // ── Diagnostic intent: inventory audit ───────────────────────────────
+      // Deterministic Mongo queries — no pricing, no LLM ranking. Returns a
+      // list of partners with the issue label so the UI can render a "fix this"
+      // action. Useful for "hotels missing rate lists", "rate lists expiring",
+      // etc.
+      if (effectiveParsed.intent === 'diagnostic' && effectiveParsed.diagnostic) {
+        const diag = await executeDiagnostic({
+          parsed: effectiveParsed,
+          organizationId: req.organizationId,
+        });
+        log(diag.items.length > 0 ? 'diagnostic_items' : 'diagnostic_clean', { resultCount: diag.items.length });
+        return res.json({
+          intent: 'diagnostic',
+          parsed: effectiveParsed,
+          diagnostic: diag.diagnostic,
+          label: diag.label,
+          items: diag.items,
+          totalCount: diag.totalCount,
+          canonical: diag.canonical,
+          warnings: diag.warnings,
         });
       }
 
@@ -123,6 +171,7 @@ router.post(
         !effectiveParsed.destinationName &&
         !(effectiveParsed.mustHave?.length);
       if (noNarrowingSignal) {
+        log('clarification');
         return res.json({
           intent: 'search',
           parsed: effectiveParsed,
@@ -143,6 +192,10 @@ router.post(
         query,
       });
 
+      log(results.length > 0 ? 'results' : 'no_results', {
+        resultCount: results.length,
+        vectorPathUsed: !!effectiveParsed.mustHave?.length,
+      });
       return res.json({
         intent: 'search',
         parsed: effectiveParsed,
@@ -156,6 +209,7 @@ router.post(
       const status = err.status || 500;
       const message = status === 500 ? 'Search failed. Please try again.' : err.message;
       console.error('[search] failed:', err);
+      log('error');
       return res.status(status).json({ message });
     }
   }

@@ -15,12 +15,13 @@ const PARSER_MODEL = 'claude-haiku-4-5';
 // Hand-built so the model can't drift. Every field has a default the executor
 // treats as "not specified" — null for scalars, [] for arrays, {} for objects.
 const EMPTY_PARSED = {
-  intent: 'search',           // 'search' (find me X) | 'lookup' (tell me about X)
+  intent: 'search',           // 'search' (find me X) | 'lookup' (tell me about X) | 'diagnostic' (audit my inventory)
   type: null,                 // 'hotel' | 'activity' | 'transport' | 'package' | null
   destinationName: null,      // free text — executor fuzzy-matches against Destination + partner.destination
   propertyType: null,         // null = any property; otherwise subset of Hotel.type enum to narrow to (e.g. ['tented_camp', 'conservancy_camp'])
   subjectName: null,          // partner name when intent='lookup' ("Serena", "Mara Serena Lodge")
   lookupTopic: null,          // when intent='lookup': 'cancellation_policy' | 'child_policy' | 'inclusions' | 'exclusions' | 'fees' | 'rates' | 'rooms' | 'amenities' | 'general'
+  diagnostic: null,           // when intent='diagnostic': 'missing_rate_lists' | 'expiring_rate_lists' | 'expired_rate_lists' | 'missing_images' | 'low_confidence_rates' | 'blocking_conditions'
   dateRange: { from: null, to: null },   // ISO yyyy-mm-dd; either side can be null
   adults: null,               // integer
   children: [],               // [{ age: number }]; if ages unknown, [{ age: null }] × count
@@ -42,12 +43,13 @@ Today is ${today}. Resolve relative dates ("July", "next month", "Easter") to ab
 Return ONLY a JSON object with this exact shape — no markdown, no commentary:
 
 {
-  "intent": "search" | "lookup",
+  "intent": "search" | "lookup" | "diagnostic",
   "type": "hotel" | "activity" | "transport" | "package" | null,
   "destinationName": string | null,
   "propertyType": ["hotel" | "lodge" | "tented_camp" | "resort" | "villa" | "apartment" | "guesthouse" | "conservancy_camp"] | null,
   "subjectName": string | null,
   "lookupTopic": "cancellation_policy" | "child_policy" | "inclusions" | "exclusions" | "fees" | "rates" | "rooms" | "amenities" | "general" | null,
+  "diagnostic": "missing_rate_lists" | "expiring_rate_lists" | "expired_rate_lists" | "missing_images" | "low_confidence_rates" | "blocking_conditions" | null,
   "dateRange": { "from": "YYYY-MM-DD" | null, "to": "YYYY-MM-DD" | null },
   "adults": integer | null,
   "children": [{ "age": integer | null }],
@@ -62,7 +64,18 @@ Return ONLY a JSON object with this exact shape — no markdown, no commentary:
 }
 
 Rules:
-- "intent": "lookup" when the operator is asking ABOUT a specific named partner ("What's the cancellation policy for Serena?", "Does Mara Serena include park fees?", "Tell me about Aldiana"). "search" when they're trying to find or filter inventory ("hotel in Mara", "tented camp under $200"). When in doubt, default to "search".
+- "intent":
+    "lookup" when the operator is asking ABOUT a specific named partner ("What's the cancellation policy for Serena?", "Does Mara Serena include park fees?", "Tell me about Aldiana").
+    "diagnostic" when the operator is auditing their inventory for missing/stale/expiring data ("hotels missing rate lists", "rate lists expiring this month", "hotels without images", "what needs cleaning up").
+    "search" when they're trying to find or filter inventory ("hotel in Mara", "tented camp under $200"). When in doubt, default to "search".
+- "diagnostic": only set when intent="diagnostic". Map the query to the closest sub-type:
+    "missing rate lists" / "no prices" / "missing pricing" / "haven't priced" → "missing_rate_lists"
+    "expiring" / "about to expire" / "running out" / "rate lists this month" → "expiring_rate_lists"
+    "expired" / "past validity" / "out of date" → "expired_rate_lists"
+    "no images" / "missing photos" / "without images" → "missing_images"
+    "low confidence" / "verify rates" / "uncertain rates" / "needs review" → "low_confidence_rates"
+    "blocking conditions" / "unacknowledged conditions" / "unresolved warnings" → "blocking_conditions"
+  Leave NULL for non-diagnostic intent.
 - "subjectName": only populated when intent="lookup". The exact partner name the operator named (e.g. "Serena", "Mara Serena Lodge", "Aldiana Kwanza"). NULL for search intent.
 - "lookupTopic": only populated when intent="lookup". Map the question to the closest topic: cancellation/refund → "cancellation_policy"; child rate/kids policy → "child_policy"; what's included/in the rate → "inclusions"; what's excluded/extras → "exclusions"; park fees/conservancy fees/levies → "fees"; price/per-night/rates → "rates"; room types/suites → "rooms"; pool/wifi/spa → "amenities"; otherwise "general". NULL for search intent.
 - For lookup intent, leave dateRange/adults/children/budgetMax/etc. NULL — those are search slots.
@@ -84,7 +97,7 @@ Rules:
 - "boardBasis": "full board" → FB, "half board" → HB, "bed and breakfast" or "B&B" → BB, "all inclusive" → AI, "room only" → RO.
 - "clientType": who's buying — selects which audience-tagged rate list applies. "retail/public/rack/walk-in/direct" → "retail". "contract/DMC/agent/trade/STO/tour operator" → "contract". "resident/EAC/East African" rates (priced for someone living locally) → "resident". Leave null if the operator didn't say.
 - "nationality": traveler nationality — selects park-fee/visa-fee tier. "citizen/Kenyan/Tanzanian/local" → "citizen". "resident/expat/work-permit holder" → "resident". "non-resident/foreigner/international/overseas" → "nonResident". Note: "resident" can mean either clientType or nationality — set both if the operator clearly means resident-priced AND resident traveler; otherwise pick the one that fits context. Leave null if the operator didn't say.
-- "mustHave"/"niceToHave": short literal qualitative cues from the query ("pool", "tented", "luxury", "honeymoon"). Don't invent — only include what the operator wrote. Don't put clientType/nationality words here; they have their own fields.
+- "mustHave"/"niceToHave": short literal qualitative cues from the query ("pool", "tented", "luxury", "honeymoon"). Don't invent — only include what the operator wrote. Don't put clientType/nationality words here; they have their own fields. Don't put property-type words ("hotel", "lodge", "camp", "villa", etc.) here — those go in propertyType. Don't put sort or ranking words here either: "cheapest", "best", "lowest priced", "most affordable", "top", "highest rated", "most expensive", "biggest", "newest" are sort cues, not filter cues — the executor already sorts cheapest-first by default, so leave them out and the operator still gets what they wanted.
 - "confidence": 1.0 when the operator's intent is unambiguous, 0.5 when partly inferred (e.g. you assumed the year), 0.0 when the field is null because the operator didn't say. Always include all confidence keys listed in the schema.
 
 Examples:
@@ -129,6 +142,27 @@ Query: "tented camp in Mara"
   "mustHave": [],
   "niceToHave": [],
   "confidence": { "intent": 1, "type": 1, "destinationName": 0.8, "propertyType": 1, "subjectName": 0, "lookupTopic": 0, "dateRange": 0, "adults": 0, "children": 0, "budgetMax": 0, "clientType": 0, "nationality": 0 }
+}
+
+Query: "cheapest hotel in Mara"
+{
+  "intent": "search",
+  "type": "hotel",
+  "destinationName": "Mara",
+  "propertyType": null,
+  "subjectName": null,
+  "lookupTopic": null,
+  "dateRange": { "from": null, "to": null },
+  "adults": null,
+  "children": [],
+  "budgetMax": null,
+  "currency": null,
+  "boardBasis": null,
+  "clientType": null,
+  "nationality": null,
+  "mustHave": [],
+  "niceToHave": [],
+  "confidence": { "intent": 1, "type": 1, "destinationName": 0.9, "propertyType": 1, "subjectName": 0, "lookupTopic": 0, "dateRange": 0, "adults": 0, "children": 0, "budgetMax": 0, "clientType": 0, "nationality": 0 }
 }
 
 Query: "luxury lodge or villa in Diani"
@@ -234,6 +268,50 @@ Query: "Does Mara Serena include park fees?"
   "mustHave": [],
   "niceToHave": [],
   "confidence": { "intent": 1, "type": 0.8, "destinationName": 0, "propertyType": 0, "subjectName": 1, "lookupTopic": 1, "dateRange": 0, "adults": 0, "children": 0, "budgetMax": 0, "clientType": 0, "nationality": 0 }
+}
+
+Query: "hotels missing rate lists in Mara"
+{
+  "intent": "diagnostic",
+  "type": "hotel",
+  "destinationName": "Mara",
+  "propertyType": null,
+  "subjectName": null,
+  "lookupTopic": null,
+  "diagnostic": "missing_rate_lists",
+  "dateRange": { "from": null, "to": null },
+  "adults": null,
+  "children": [],
+  "budgetMax": null,
+  "currency": null,
+  "boardBasis": null,
+  "clientType": null,
+  "nationality": null,
+  "mustHave": [],
+  "niceToHave": [],
+  "confidence": { "intent": 1, "type": 1, "destinationName": 1, "propertyType": 0, "subjectName": 0, "lookupTopic": 0, "dateRange": 0, "adults": 0, "children": 0, "budgetMax": 0, "clientType": 0, "nationality": 0 }
+}
+
+Query: "rate lists expiring this month"
+{
+  "intent": "diagnostic",
+  "type": "hotel",
+  "destinationName": null,
+  "propertyType": null,
+  "subjectName": null,
+  "lookupTopic": null,
+  "diagnostic": "expiring_rate_lists",
+  "dateRange": { "from": null, "to": null },
+  "adults": null,
+  "children": [],
+  "budgetMax": null,
+  "currency": null,
+  "boardBasis": null,
+  "clientType": null,
+  "nationality": null,
+  "mustHave": [],
+  "niceToHave": [],
+  "confidence": { "intent": 1, "type": 0.7, "destinationName": 0, "propertyType": 0, "subjectName": 0, "lookupTopic": 0, "dateRange": 0, "adults": 0, "children": 0, "budgetMax": 0, "clientType": 0, "nationality": 0 }
 }`;
 }
 
@@ -268,15 +346,25 @@ const VALID_PROPERTY_TYPES = [
   'hotel', 'lodge', 'tented_camp', 'resort', 'villa', 'apartment', 'guesthouse', 'conservancy_camp',
 ];
 
+const VALID_DIAGNOSTICS = [
+  'missing_rate_lists', 'expiring_rate_lists', 'expired_rate_lists',
+  'missing_images', 'low_confidence_rates', 'blocking_conditions',
+];
+
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') return { ...EMPTY_PARSED };
   const out = { ...EMPTY_PARSED, confidence: {} };
 
-  out.intent = raw.intent === 'lookup' ? 'lookup' : 'search';
+  if (['lookup', 'diagnostic'].includes(raw.intent)) {
+    out.intent = raw.intent;
+  } else {
+    out.intent = 'search';
+  }
   if (['hotel', 'activity', 'transport', 'package'].includes(raw.type)) out.type = raw.type;
   if (typeof raw.destinationName === 'string' && raw.destinationName.trim()) out.destinationName = raw.destinationName.trim();
   if (typeof raw.subjectName === 'string' && raw.subjectName.trim()) out.subjectName = raw.subjectName.trim();
   if (VALID_LOOKUP_TOPICS.includes(raw.lookupTopic)) out.lookupTopic = raw.lookupTopic;
+  if (VALID_DIAGNOSTICS.includes(raw.diagnostic)) out.diagnostic = raw.diagnostic;
   // propertyType: only keep enum-valid entries; treat empty array same as null
   // (don't narrow — operator gets all property types).
   if (Array.isArray(raw.propertyType)) {
@@ -286,6 +374,8 @@ function normalize(raw) {
   // Lookup intent without a subject is meaningless — demote to search and let
   // the route's clarification path ask for one.
   if (out.intent === 'lookup' && !out.subjectName) out.intent = 'search';
+  // Diagnostic intent without a sub-type is meaningless — same demotion.
+  if (out.intent === 'diagnostic' && !out.diagnostic) out.intent = 'search';
 
   if (raw.dateRange && typeof raw.dateRange === 'object') {
     const from = typeof raw.dateRange.from === 'string' ? raw.dateRange.from : null;
@@ -311,7 +401,7 @@ function normalize(raw) {
   out.niceToHave = Array.isArray(raw.niceToHave) ? raw.niceToHave.filter(s => typeof s === 'string').slice(0, 10) : [];
 
   if (raw.confidence && typeof raw.confidence === 'object') {
-    for (const k of ['intent', 'type', 'destinationName', 'propertyType', 'subjectName', 'lookupTopic', 'dateRange', 'adults', 'children', 'budgetMax', 'clientType', 'nationality']) {
+    for (const k of ['intent', 'type', 'destinationName', 'propertyType', 'subjectName', 'lookupTopic', 'diagnostic', 'dateRange', 'adults', 'children', 'budgetMax', 'clientType', 'nationality']) {
       const v = raw.confidence[k];
       out.confidence[k] = Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
     }
