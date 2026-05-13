@@ -232,7 +232,52 @@ router.get('/orgs', async (req, res) => {
     const filter = {};
     if (req.query.status) filter.subscriptionStatus = req.query.status;
     if (req.query.plan) filter.plan = req.query.plan;
-    if (req.query.q) filter.name = { $regex: req.query.q, $options: 'i' };
+
+    // ?q= matches against org name, owner email, owner phone, and the org's
+    // businessInfo.phone. Phone matching is normalised so all of these find
+    // the same Kenya mobile:
+    //   "0734567890"     (local leading-0 format)
+    //   "+254734567890"  (E.164)
+    //   "254 734 567 890" (mixed-format)
+    //   "734567890"      (raw subscriber digits)
+    // Strategy: take the digits of the query; build candidate substrings that
+    // strip the leading 0 or 254 country code; OR-match every candidate against
+    // both User.phone and businessInfo.phone. Owner-email is matched via a
+    // pre-lookup of User → orgIds so we can keep the $match before the
+    // expensive $lookups in the aggregate.
+    if (req.query.q) {
+      const q = req.query.q.trim();
+      const escapedQ = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const or = [{ name: { $regex: escapedQ, $options: 'i' } }];
+
+      const digits = q.replace(/[^0-9]/g, '');
+      const phoneCandidates = new Set();
+      if (digits.length >= 4) {
+        phoneCandidates.add(digits);
+        if (digits.startsWith('0') && digits.length > 4) phoneCandidates.add(digits.slice(1));
+        if (digits.startsWith('254') && digits.length > 6) phoneCandidates.add(digits.slice(3));
+      }
+
+      // Pre-lookup: find any user whose email or phone matches. Their org IDs
+      // expand the org filter via _id: $in. This costs one extra query but
+      // keeps the orgs aggregate from having to scan-then-filter across the
+      // full collection.
+      const userOr = [{ email: { $regex: escapedQ, $options: 'i' } }];
+      for (const p of phoneCandidates) {
+        userOr.push({ phone: { $regex: p, $options: 'i' } });
+      }
+      const matchingUsers = await User.find({ $or: userOr }).select('organization').lean();
+      const userOrgIds = [...new Set(matchingUsers.map((u) => String(u.organization)))]
+        .map((id) => new mongoose.Types.ObjectId(id));
+      if (userOrgIds.length) or.push({ _id: { $in: userOrgIds } });
+
+      // Also match the org's own businessInfo.phone (separate from owner).
+      for (const p of phoneCandidates) {
+        or.push({ 'businessInfo.phone': { $regex: p, $options: 'i' } });
+      }
+
+      filter.$or = or;
+    }
 
     // Allowlist sortable fields — anything else falls back to createdAt to
     // avoid arbitrary-field sorts hitting unindexed columns. lastActiveAt is
@@ -646,8 +691,22 @@ router.get('/users', async (req, res) => {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
     const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
 
+    // Phone-aware search: same normalisation as /admin/orgs. If q has 4+
+    // digits, also match User.phone against the digit-stripped query plus
+    // variants without the leading 0 / 254 country code.
+    const digits = q.replace(/[^0-9]/g, '');
+    const orClauses = [{ email: rx }, { name: rx }];
+    if (digits.length >= 4) {
+      const candidates = new Set([digits]);
+      if (digits.startsWith('0') && digits.length > 4) candidates.add(digits.slice(1));
+      if (digits.startsWith('254') && digits.length > 6) candidates.add(digits.slice(3));
+      for (const p of candidates) {
+        orClauses.push({ phone: { $regex: p, $options: 'i' } });
+      }
+    }
+
     const items = await User.aggregate([
-      { $match: { $or: [{ email: rx }, { name: rx }] } },
+      { $match: { $or: orClauses } },
       { $sort: { lastLogin: -1, createdAt: -1 } },
       { $limit: limit },
       { $lookup: {
