@@ -66,8 +66,8 @@ Return ONLY a JSON object with this exact shape — no markdown, no commentary:
 Rules:
 - "intent":
     "lookup" when the operator is asking ABOUT a specific named partner ("What's the cancellation policy for Serena?", "Does Mara Serena include park fees?", "Tell me about Aldiana").
-    "diagnostic" when the operator is auditing their inventory for missing/stale/expiring data ("hotels missing rate lists", "rate lists expiring this month", "hotels without images", "what needs cleaning up").
-    "search" when they're trying to find or filter inventory ("hotel in Mara", "tented camp under $200"). When in doubt, default to "search".
+    "diagnostic" ONLY when the operator names a data-quality issue: missing / stale / expiring / expired / low confidence / blocking / without images. Examples: "hotels missing rate lists", "rate lists expiring this month", "hotels without images", "what needs cleaning up". A plain inventory presence question like "do I have any X in Y?" / "show me X in Y" / "are there any X in Y?" / "list X" / "find X in Y" is NOT diagnostic — it's "search". The diagnostic intent always pairs with an issue keyword; if none is present, treat as search.
+    "search" when the operator is trying to find or filter inventory ("hotel in Mara", "tented camp under $200", "do I have any activities in Nanyuki", "show me lodges in Amboseli", "list packages"). When in doubt, default to "search".
 - "diagnostic": only set when intent="diagnostic". Map the query to the closest sub-type:
     "missing rate lists" / "no prices" / "missing pricing" / "haven't priced" → "missing_rate_lists"
     "expiring" / "about to expire" / "running out" / "rate lists this month" → "expiring_rate_lists"
@@ -142,6 +142,28 @@ Query: "tented camp in Mara"
   "mustHave": [],
   "niceToHave": [],
   "confidence": { "intent": 1, "type": 1, "destinationName": 0.8, "propertyType": 1, "subjectName": 0, "lookupTopic": 0, "dateRange": 0, "adults": 0, "children": 0, "budgetMax": 0, "clientType": 0, "nationality": 0 }
+}
+
+Query: "do I have any activities in Nanyuki?"
+{
+  "intent": "search",
+  "type": "activity",
+  "destinationName": "Nanyuki",
+  "propertyType": null,
+  "subjectName": null,
+  "lookupTopic": null,
+  "diagnostic": null,
+  "dateRange": { "from": null, "to": null },
+  "adults": null,
+  "children": [],
+  "budgetMax": null,
+  "currency": null,
+  "boardBasis": null,
+  "clientType": null,
+  "nationality": null,
+  "mustHave": [],
+  "niceToHave": [],
+  "confidence": { "intent": 1, "type": 1, "destinationName": 1, "propertyType": 1, "subjectName": 0, "lookupTopic": 0, "diagnostic": 0, "dateRange": 0, "adults": 0, "children": 0, "budgetMax": 0, "clientType": 0, "nationality": 0 }
 }
 
 Query: "cheapest hotel in Mara"
